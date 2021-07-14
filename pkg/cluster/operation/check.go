@@ -150,15 +150,35 @@ func checkOSInfo(opt *CheckOptions, osInfo *sysinfo.OS) *CheckResult {
 
 	// check OS vendor
 	switch osInfo.Vendor {
-	case "centos", "redhat":
+	case "centos", "redhat", "rhel":
 		// check version
 		if ver, _ := strconv.Atoi(osInfo.Version); ver < 7 {
 			result.Err = fmt.Errorf("%s %s not supported, use version 7 or higher",
 				osInfo.Name, osInfo.Release)
 			return result
 		}
-	case "debian", "ubuntu":
-		// check version
+	case "debian":
+		// debian support is not fully tested, but we suppose it should work
+		msg := "debian support is not fully tested, be careful"
+		result.Err = fmt.Errorf("%s (%s)", result.Msg, msg)
+		result.Warn = true
+		if ver, _ := strconv.Atoi(osInfo.Version); ver < 9 {
+			result.Err = fmt.Errorf("%s %s not supported, use version 9 or higher (%s)",
+				osInfo.Name, osInfo.Release, msg)
+			result.Warn = false
+			return result
+		}
+	case "ubuntu":
+		// ubuntu support is not fully tested, but we suppose it should work
+		msg := "ubuntu support is not fully tested, be careful"
+		result.Err = fmt.Errorf("%s (%s)", result.Msg, msg)
+		result.Warn = true
+		if ver, _ := strconv.ParseFloat(osInfo.Version, 64); ver < 18.04 {
+			result.Err = fmt.Errorf("%s %s not supported, use version 18.04 or higher (%s)",
+				osInfo.Name, osInfo.Release, msg)
+			result.Warn = false
+			return result
+		}
 	default:
 		result.Err = fmt.Errorf("os vendor %s not supported", osInfo.Vendor)
 		return result
@@ -467,8 +487,15 @@ func CheckSELinux(ctx context.Context, e ctxt.Executor) *CheckResult {
 		return result
 	}
 	out := strings.Trim(string(stdout), "\n")
-	if lines, err := strconv.Atoi(out); err != nil || lines > 0 {
-		result.Err = fmt.Errorf("SELinux is not disabled, %d %s", lines, err)
+	lines, err := strconv.Atoi(out)
+	if err != nil {
+		result.Err = fmt.Errorf("can not check SELinux status, please validate manually, %s", err)
+		result.Warn = true
+		return result
+	}
+
+	if lines > 0 {
+		result.Err = fmt.Errorf("SELinux is not disabled")
 	} else {
 		result.Msg = "SELinux is disabled"
 	}
@@ -727,8 +754,8 @@ func CheckTHP(ctx context.Context, e ctxt.Executor) *CheckResult {
 	}
 
 	m := module.NewShellModule(module.ShellModuleConfig{
-		Command: "cat /sys/kernel/mm/transparent_hugepage/{enabled,defrag}",
-		Sudo:    false,
+		Command: fmt.Sprintf(`if [ -d %[1]s ]; then cat %[1]s/{enabled,defrag}; fi`, "/sys/kernel/mm/transparent_hugepage"),
+		Sudo:    true,
 	})
 	stdout, stderr, err := m.Execute(ctx, e)
 	if err != nil {
@@ -737,7 +764,7 @@ func CheckTHP(ctx context.Context, e ctxt.Executor) *CheckResult {
 	}
 
 	for _, line := range strings.Split(strings.Trim(string(stdout), "\n"), "\n") {
-		if !strings.Contains(line, "[never]") {
+		if len(line) > 0 && !strings.Contains(line, "[never]") {
 			result.Err = fmt.Errorf("THP is enabled, please disable it for best performance")
 			return result
 		}

@@ -16,7 +16,6 @@ package command
 import (
 	"path"
 
-	"github.com/pingcap/tiup/pkg/cluster/executor"
 	"github.com/pingcap/tiup/pkg/cluster/manager"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/utils"
@@ -40,9 +39,9 @@ conflict checks with other clusters`,
 			if len(args) != 1 {
 				return cmd.Help()
 			}
-			// natvie ssh has it's own logic to find the default identity_file
-			if gOpt.SSHType == executor.SSHTypeSystem && !utils.IsFlagSetByUser(cmd.Flags(), "identity_file") {
-				opt.IdentityFile = ""
+
+			if opt.ExistCluster {
+				clusterReport.ID = scrubClusterName(args[0])
 			}
 			return cm.CheckCluster(args[0], opt, gOpt)
 		},

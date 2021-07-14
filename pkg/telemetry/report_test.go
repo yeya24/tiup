@@ -11,14 +11,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package errutil
+package telemetry
 
-import "github.com/joomcode/errorx"
+import (
+	"context"
+	"testing"
 
-var (
-	// ErrPropSuggestion is a property of an Error that will be printed as the suggestion.
-	ErrPropSuggestion = errorx.RegisterProperty("suggestion")
-
-	// ErrTraitPreCheck means that the Error is a pre-check error so that no error logs will be outputted directly.
-	ErrTraitPreCheck = errorx.RegisterTrait("pre_check")
+	"github.com/pingcap/check"
 )
+
+type reportSuite struct{}
+
+var _ = check.Suite(&reportSuite{})
+
+func TestT(t *testing.T) { check.TestingT(t) }
+
+func (s *reportSuite) TestNodeInfo(c *check.C) {
+	info := new(NodeInfo)
+	err := FillNodeInfo(context.Background(), info)
+	c.Assert(err, check.IsNil)
+
+	text, err := NodeInfoToText(info)
+	c.Assert(err, check.IsNil)
+
+	info2, err := NodeInfoFromText(text)
+	c.Assert(err, check.IsNil)
+	c.Assert(info2, check.DeepEquals, info)
+}

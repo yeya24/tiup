@@ -11,32 +11,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package report
+package telemetry
 
 import (
 	"bytes"
 	"os"
+	"runtime"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/pingcap/tiup/pkg/localdata"
-	tiuptele "github.com/pingcap/tiup/pkg/telemetry"
+	"github.com/pingcap/tiup/pkg/version"
 )
 
-// Enable return true if we enable telemetry.
-func Enable() bool {
+// Enabled return true if we enable telemetry.
+func Enabled() bool {
 	s := os.Getenv(localdata.EnvNameTelemetryStatus)
-	status := tiuptele.Status(s)
-	return status == tiuptele.EnableStatus
+	status := Status(s)
+	return status == EnableStatus
 }
 
-// UUID return telemetry uuid.
-func UUID() string {
+// GetUUID return telemetry uuid.
+func GetUUID() string {
 	return os.Getenv(localdata.EnvNameTelemetryUUID)
 }
 
+// GetSecret return telemetry encrypt secret.
+func GetSecret() string {
+	return os.Getenv(localdata.EnvNameTelemetrySecret)
+}
+
+// TiUPMeta returns metadata of TiUP Cluster itself
+func TiUPMeta() *TiUPInfo {
+	return &TiUPInfo{
+		TiUPVersion:      os.Getenv(localdata.EnvNameTiUPVersion),
+		ComponentVersion: version.NewTiUPVersion().SemVer(),
+		GitRef:           version.GitRef,
+		GitCommit:        version.GitHash,
+		VerName:          version.TiUPVerName,
+		Os:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		Go:               runtime.Version(),
+	}
+}
+
 // NodeInfoFromText get telemetry.NodeInfo from the text.
-func NodeInfoFromText(text string) (info *tiuptele.NodeInfo, err error) {
-	info = new(tiuptele.NodeInfo)
+func NodeInfoFromText(text string) (info *NodeInfo, err error) {
+	info = new(NodeInfo)
 	err = proto.UnmarshalText(text, info)
 	if err != nil {
 		return nil, err
@@ -46,7 +66,7 @@ func NodeInfoFromText(text string) (info *tiuptele.NodeInfo, err error) {
 }
 
 // NodeInfoToText get telemetry.NodeInfo in text.
-func NodeInfoToText(info *tiuptele.NodeInfo) (text string, err error) {
+func NodeInfoToText(info *NodeInfo) (text string, err error) {
 	buf := new(bytes.Buffer)
 	err = proto.MarshalText(buf, info)
 	if err != nil {
