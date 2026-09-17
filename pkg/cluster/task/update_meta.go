@@ -37,6 +37,16 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 	deleted := set.NewStringSet(u.deletedNodeIDs...)
 	topo := u.metadata.Topology
 
+	newMeta := &spec.ClusterMeta{}
+	*newMeta = *u.metadata
+	newMeta.Topology = &spec.Specification{
+		GlobalOptions:     u.metadata.Topology.GlobalOptions,
+		MonitoredOptions:  u.metadata.Topology.MonitoredOptions,
+		ServerConfigs:     u.metadata.Topology.ServerConfigs,
+		ComponentVersions: u.metadata.Topology.ComponentVersions,
+		ComponentSources:  u.metadata.Topology.ComponentSources,
+	}
+
 	tidbServers := make([]*spec.TiDBSpec, 0)
 	for i, instance := range (&spec.TiDBComponent{Topology: topo}).Instances() {
 		if deleted.Exist(instance.ID()) {
@@ -44,7 +54,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		tidbServers = append(tidbServers, topo.TiDBServers[i])
 	}
-	topo.TiDBServers = tidbServers
+	newMeta.Topology.TiDBServers = tidbServers
 
 	tikvServers := make([]*spec.TiKVSpec, 0)
 	for i, instance := range (&spec.TiKVComponent{Topology: topo}).Instances() {
@@ -53,7 +63,16 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		tikvServers = append(tikvServers, topo.TiKVServers[i])
 	}
-	topo.TiKVServers = tikvServers
+	newMeta.Topology.TiKVServers = tikvServers
+
+	tikvWorkerServers := make([]*spec.TiKVWorkerSpec, 0)
+	for i, instance := range (&spec.TiKVWorkerComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		tikvWorkerServers = append(tikvWorkerServers, topo.TiKVWorkerServers[i])
+	}
+	newMeta.Topology.TiKVWorkerServers = tikvWorkerServers
 
 	pdServers := make([]*spec.PDSpec, 0)
 	for i, instance := range (&spec.PDComponent{Topology: topo}).Instances() {
@@ -62,7 +81,61 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		pdServers = append(pdServers, topo.PDServers[i])
 	}
-	topo.PDServers = pdServers
+	newMeta.Topology.PDServers = pdServers
+
+	tsoServers := make([]*spec.TSOSpec, 0)
+	for i, instance := range (&spec.TSOComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		tsoServers = append(tsoServers, topo.TSOServers[i])
+	}
+	newMeta.Topology.TSOServers = tsoServers
+
+	schedulingServers := make([]*spec.SchedulingSpec, 0)
+	for i, instance := range (&spec.SchedulingComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		schedulingServers = append(schedulingServers, topo.SchedulingServers[i])
+	}
+	newMeta.Topology.SchedulingServers = schedulingServers
+
+	routerServers := make([]*spec.RouterSpec, 0)
+	for i, instance := range (&spec.RouterComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		routerServers = append(routerServers, topo.RouterServers[i])
+	}
+	newMeta.Topology.RouterServers = routerServers
+
+	resourceManagers := make([]*spec.ResourceManagerSpec, 0)
+	for i, instance := range (&spec.ResourceManagerComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		resourceManagers = append(resourceManagers, topo.ResourceManagerServers[i])
+	}
+	newMeta.Topology.ResourceManagerServers = resourceManagers
+
+	tiproxyServers := make([]*spec.TiProxySpec, 0)
+	for i, instance := range (&spec.TiProxyComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		tiproxyServers = append(tiproxyServers, topo.TiProxyServers[i])
+	}
+	newMeta.Topology.TiProxyServers = tiproxyServers
+
+	dashboardServers := make([]*spec.DashboardSpec, 0)
+	for i, instance := range (&spec.DashboardComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		dashboardServers = append(dashboardServers, topo.DashboardServers[i])
+	}
+	newMeta.Topology.DashboardServers = dashboardServers
 
 	tiflashServers := make([]*spec.TiFlashSpec, 0)
 	for i, instance := range (&spec.TiFlashComponent{Topology: topo}).Instances() {
@@ -71,7 +144,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		tiflashServers = append(tiflashServers, topo.TiFlashServers[i])
 	}
-	topo.TiFlashServers = tiflashServers
+	newMeta.Topology.TiFlashServers = tiflashServers
 
 	pumpServers := make([]*spec.PumpSpec, 0)
 	for i, instance := range (&spec.PumpComponent{Topology: topo}).Instances() {
@@ -80,7 +153,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		pumpServers = append(pumpServers, topo.PumpServers[i])
 	}
-	topo.PumpServers = pumpServers
+	newMeta.Topology.PumpServers = pumpServers
 
 	drainerServers := make([]*spec.DrainerSpec, 0)
 	for i, instance := range (&spec.DrainerComponent{Topology: topo}).Instances() {
@@ -89,7 +162,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		drainerServers = append(drainerServers, topo.Drainers[i])
 	}
-	topo.Drainers = drainerServers
+	newMeta.Topology.Drainers = drainerServers
 
 	cdcServers := make([]*spec.CDCSpec, 0)
 	for i, instance := range (&spec.CDCComponent{Topology: topo}).Instances() {
@@ -98,7 +171,16 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		cdcServers = append(cdcServers, topo.CDCServers[i])
 	}
-	topo.CDCServers = cdcServers
+	newMeta.Topology.CDCServers = cdcServers
+
+	tikvCDCServers := make([]*spec.TiKVCDCSpec, 0)
+	for i, instance := range (&spec.TiKVCDCComponent{Topology: topo}).Instances() {
+		if deleted.Exist(instance.ID()) {
+			continue
+		}
+		tikvCDCServers = append(tikvCDCServers, topo.TiKVCDCServers[i])
+	}
+	newMeta.Topology.TiKVCDCServers = tikvCDCServers
 
 	tisparkWorkers := make([]*spec.TiSparkWorkerSpec, 0)
 	for i, instance := range (&spec.TiSparkWorkerComponent{Topology: topo}).Instances() {
@@ -107,7 +189,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		tisparkWorkers = append(tisparkWorkers, topo.TiSparkWorkers[i])
 	}
-	topo.TiSparkWorkers = tisparkWorkers
+	newMeta.Topology.TiSparkWorkers = tisparkWorkers
 
 	tisparkMasters := make([]*spec.TiSparkMasterSpec, 0)
 	for i, instance := range (&spec.TiSparkMasterComponent{Topology: topo}).Instances() {
@@ -116,7 +198,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		tisparkMasters = append(tisparkMasters, topo.TiSparkMasters[i])
 	}
-	topo.TiSparkMasters = tisparkMasters
+	newMeta.Topology.TiSparkMasters = tisparkMasters
 
 	monitors := make([]*spec.PrometheusSpec, 0)
 	for i, instance := range (&spec.MonitorComponent{Topology: topo}).Instances() {
@@ -125,7 +207,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		monitors = append(monitors, topo.Monitors[i])
 	}
-	topo.Monitors = monitors
+	newMeta.Topology.Monitors = monitors
 
 	grafanas := make([]*spec.GrafanaSpec, 0)
 	for i, instance := range (&spec.GrafanaComponent{Topology: topo}).Instances() {
@@ -134,7 +216,7 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		grafanas = append(grafanas, topo.Grafanas[i])
 	}
-	topo.Grafanas = grafanas
+	newMeta.Topology.Grafanas = grafanas
 
 	alertmanagers := make([]*spec.AlertmanagerSpec, 0)
 	for i, instance := range (&spec.AlertManagerComponent{Topology: topo}).Instances() {
@@ -143,9 +225,9 @@ func (u *UpdateMeta) Execute(ctx context.Context) error {
 		}
 		alertmanagers = append(alertmanagers, topo.Alertmanagers[i])
 	}
-	topo.Alertmanagers = alertmanagers
+	newMeta.Topology.Alertmanagers = alertmanagers
 
-	return spec.SaveClusterMeta(u.cluster, u.metadata)
+	return spec.SaveClusterMeta(u.cluster, newMeta)
 }
 
 // Rollback implements the Task interface

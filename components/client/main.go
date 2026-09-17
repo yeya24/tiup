@@ -15,7 +15,7 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -25,8 +25,9 @@ import (
 
 	ui "github.com/gizak/termui/v3"
 	"github.com/gizak/termui/v3/widgets"
+	"github.com/pingcap/tiup/pkg/environment"
 	"github.com/pingcap/tiup/pkg/localdata"
-	"github.com/pingcap/tiup/pkg/utils"
+	"github.com/pingcap/tiup/pkg/repository"
 	gops "github.com/shirou/gopsutil/process"
 	"github.com/spf13/cobra"
 	_ "github.com/xo/usql/drivers/mysql"
@@ -51,7 +52,15 @@ func execute() error {
 			if len(args) > 0 {
 				target = args[0]
 			}
+			env, err := environment.InitEnv(repository.Options{}, repository.MirrorOptions{})
+			if err != nil {
+				return err
+			}
+			environment.SetGlobalEnv(env)
 			return connect(target)
+		},
+		PostRunE: func(cmd *cobra.Command, args []string) error {
+			return environment.GlobalEnv().Close()
 		},
 	}
 
@@ -68,7 +77,7 @@ func connect(target string) error {
 		return fmt.Errorf("error on read files: %s", err.Error())
 	}
 	if len(endpoints) == 0 {
-		return fmt.Errorf("It seems no playground is running, execute `tiup playground` to start one")
+		return fmt.Errorf("it seems no playground is running, execute `tiup playground` to start one")
 	}
 	var ep *endpoint
 	if target == "" {
@@ -94,7 +103,7 @@ func connect(target string) error {
 		return fmt.Errorf("can't open history file: %s", err.Error())
 	}
 	h := handler.New(l, u, os.Getenv(localdata.EnvNameInstanceDataDir), true)
-	if err = h.Open(ep.dsn); err != nil {
+	if err = h.Open(context.TODO(), ep.dsn); err != nil {
 		return fmt.Errorf("can't open connection to %s: %s", ep.dsn, err.Error())
 	}
 	if err = h.Run(); err != io.EOF {
@@ -121,32 +130,15 @@ func scanEndpoint(tiupHome string) ([]*endpoint, error) {
 }
 
 func isInstanceAlive(tiupHome, instance string) bool {
-	metaFile := path.Join(tiupHome, localdata.DataParentDir, instance, localdata.MetaFilename)
-
-	// If the path doesn't contain the meta file, which means startup interrupted
-	if utils.IsNotExist(metaFile) {
-		return false
-	}
-
-	file, err := os.Open(metaFile)
+	s, err := environment.GlobalEnv().Profile().ReadMetaFile(instance)
 	if err != nil {
 		return false
 	}
-	defer file.Close()
-	var process map[string]interface{}
-	if err := json.NewDecoder(file).Decode(&process); err != nil {
+	if s == nil {
 		return false
 	}
-
-	if v, ok := process["pid"]; !ok {
-		return false
-	} else if pid, ok := v.(float64); !ok {
-		return false
-	} else if exist, err := gops.PidExists(int32(pid)); err != nil {
-		return false
-	} else {
-		return exist
-	}
+	exist, _ := gops.PidExists(int32(s.Pid))
+	return exist
 }
 
 func readDsn(dir, component string) []*endpoint {
@@ -176,7 +168,7 @@ func selectEndpoint(endpoints []*endpoint) *endpoint {
 	defer ui.Close()
 
 	l := widgets.NewList()
-	l.Title = "Choose a endpoint to connect"
+	l.Title = "Choose an endpoint to connect"
 
 	ml := 0
 	for _, ep := range endpoints {
@@ -191,10 +183,7 @@ func selectEndpoint(endpoints []*endpoint) *endpoint {
 	l.TextStyle = ui.NewStyle(ui.ColorWhite)
 	l.SelectedRowStyle = ui.NewStyle(ui.ColorGreen)
 	l.WrapText = false
-	size := 16
-	if len(endpoints) < size {
-		size = len(endpoints)
-	}
+	size := min(len(endpoints), 16)
 	l.SetRect(0, 0, 80, size+2)
 
 	ui.Render(l)

@@ -17,31 +17,37 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/fatih/color"
+	"github.com/google/uuid"
 	perrs "github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/environment"
-	"github.com/pingcap/tiup/pkg/exec"
+	tiupexec "github.com/pingcap/tiup/pkg/exec"
 	"github.com/pingcap/tiup/pkg/localdata"
-	"github.com/pingcap/tiup/pkg/logger/log"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/repository"
 	"github.com/pingcap/tiup/pkg/repository/v1manifest"
 	"github.com/pingcap/tiup/pkg/version"
 	"github.com/spf13/cobra"
 )
 
-var rootCmd *cobra.Command
-var repoOpts repository.Options
+var (
+	rootCmd   *cobra.Command
+	repoOpts  repository.Options
+	eventUUID = uuid.New().String()
+	log       = logprinter.NewLogger("") // use default logger
+)
+
+// arguments
+var binPath string
 
 func init() {
 	cobra.EnableCommandSorting = false
-
-	var (
-		binary       string
-		binPath      string
-		tag          string
-		printVersion bool // not using cobra.Command.Version to make it possible to show component versions
-	)
+	_ = os.Setenv(localdata.EnvNameTelemetryEventUUID, eventUUID)
 
 	rootCmd = &cobra.Command{
 		Use: `tiup [flags] <command> [args...]
@@ -51,27 +57,36 @@ TiDB platform components to the local system. You can run a specific version of 
 "tiup <component>[:version]". If no version number is specified, the latest version installed
 locally will be used. If the specified component does not have any version installed locally,
 the latest stable version will be downloaded from the repository.`,
+		Example: `  $ tiup playground                    # Quick start
+  $ tiup playground nightly            # Start a playground with the latest nightly version
+  $ tiup install <component>[:version] # Install a component of specific version
+  $ tiup update --all                  # Update all installed components to the latest version
+  $ tiup update --nightly              # Update all installed components to the nightly version
+  $ tiup update --self                 # Update the "tiup" to the latest version
+  $ tiup list                          # Fetch the latest supported components list
+  $ tiup status                        # Display all running/terminated instances
+  $ tiup clean <name>                  # Clean the data of running/terminated instance (Kill process if it's running)
+  $ tiup clean --all                   # Clean the data of all running/terminated instances`,
 
 		SilenceErrors:      true,
-		FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
+		DisableFlagParsing: true,
 		Args: func(cmd *cobra.Command, args []string) error {
 			// Support `tiup <component>`
 			return nil
 		},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			if printVersion && len(args) == 0 {
+			if shouldSkipEnvInit(cmd, args) {
 				return nil
 			}
 			switch cmd.Name() {
-			case "init",
-				"set":
+			case "init", "rotate", "set":
 				if cmd.HasParent() && cmd.Parent().Name() == "mirror" {
 					// skip environment init
 					break
 				}
 				fallthrough
 			default:
-				e, err := environment.InitEnv(repoOpts)
+				e, err := environment.InitEnv(repoOpts, repository.MirrorOptions{})
 				if err != nil {
 					if errors.Is(perrs.Cause(err), v1manifest.ErrLoadManifest) {
 						log.Warnf("Please check for root manifest file, you may download one from the repository mirror, or try `tiup mirror set` to force reset it.")
@@ -83,13 +98,28 @@ the latest stable version will be downloaded from the repository.`,
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if printVersion && len(args) == 0 {
-				fmt.Println(version.NewTiUPVersion().String())
-				return nil
+			if len(args) == 0 {
+				return cmd.Help()
 			}
 			env := environment.GlobalEnv()
-			if binary != "" {
-				component, ver := environment.ParseCompVersion(binary)
+			forcePull := false
+
+			// TBD: change this flag to subcommand
+
+			// We assume the first unknown parameter is the component name and following
+			// parameters will be transparently passed because registered flags and
+			// subcommands will be parsed correctly.
+			switch args[0] {
+			case "--help", "-h":
+				return cmd.Help()
+			case "--version", "-v":
+				fmt.Println(version.NewTiUPVersion().String())
+				return nil
+			case "--binary":
+				if len(args) < 2 {
+					return fmt.Errorf("flag needs an argument: %s", args[0])
+				}
+				component, ver := environment.ParseCompVersion(args[1])
 				selectedVer, err := env.SelectInstalledVersion(component, ver)
 				if err != nil {
 					return err
@@ -100,45 +130,65 @@ the latest stable version will be downloaded from the repository.`,
 				}
 				fmt.Println(binaryPath)
 				return nil
-			}
-			if len(args) > 0 {
-				// We assume the first unknown parameter is the component name and following
-				// parameters will be transparent passed because registered flags and subcommands
-				// will be parsed correctly.
-				// e.g: tiup --tag mytag --rm playground --db 3 --pd 3 --kv 4
-				//   => run "playground" with parameters "--db 3 --pd 3 --kv 4"
-				// tiup --tag mytag --binpath /xxx/tikv-server tikv
-				var transparentParams []string
-				componentSpec := args[0]
-				for i, arg := range os.Args {
-					if arg == componentSpec {
-						transparentParams = os.Args[i+1:]
-						break
-					}
+			case "--binpath":
+				if len(args) < 2 {
+					return fmt.Errorf("flag %s needs an argument", args[0])
 				}
-				return exec.RunComponent(env, tag, componentSpec, binPath, transparentParams)
+				binPath = args[1]
+				args = args[2:]
+			case "--force-pull":
+				forcePull = true
 			}
-			return cmd.Help()
+
+			if len(args) < 1 {
+				return cmd.Help()
+			}
+
+			runArgs := parseRootComponentArgs(args, binPath, forcePull)
+
+			return tiupexec.RunComponent(env, "", runArgs.componentSpec, runArgs.binPath, runArgs.forcePull, runArgs.componentArgs)
 		},
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-			if env := environment.GlobalEnv(); env != nil {
-				return env.Close()
-			}
-			return nil
+			return environment.GlobalEnv().Close()
 		},
 		SilenceUsage: true,
+		// implement auto completion for tiup components
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			env := environment.GlobalEnv()
+			if len(args) == 0 {
+				var result []string
+				installed, _ := env.Profile().InstalledComponents()
+				for _, comp := range installed {
+					if strings.HasPrefix(comp, toComplete) {
+						result = append(result, comp)
+					}
+				}
+				return result, cobra.ShellCompDirectiveNoFileComp
+			}
+
+			component, version := environment.ParseCompVersion(args[0])
+
+			selectedVer, err := env.SelectInstalledVersion(component, version)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			binaryPath, err := env.BinaryPath(component, selectedVer)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+
+			argv := []string{binaryPath, "__complete"}
+			argv = append(append(argv, args[1:]...), toComplete)
+			_ = syscall.Exec(binaryPath, argv, os.Environ())
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
 	}
 
-	rootCmd.PersistentFlags().BoolVarP(&repoOpts.SkipVersionCheck, "skip-version-check", "", false, "Skip the strict version check, by default a version must be a valid SemVer string")
-	rootCmd.Flags().StringVarP(&binary, "binary", "B", "", "Print binary path of a specific version of a component `<component>[:version]`\n"+
+	// useless, exist to generate help information
+	rootCmd.Flags().String("binary", "", "Print binary path of a specific version of a component `<component>[:version]`\n"+
 		"and the latest version installed will be selected if no version specified")
-	rootCmd.Flags().StringVarP(&tag, "tag", "T", "", "Specify a tag for component instance")
-	rootCmd.Flags().StringVar(&binPath, "binpath", "", "Specify the binary path of component instance")
-	// Some components will define themself -h flag, eg:
-	// $ tiup dumpling -h ${host}.
-	// We try to leave the handling of `-h` flag to the component.
-	rootCmd.PersistentFlags().Bool("help", false, "Help for this command")
-	rootCmd.Flags().BoolVarP(&printVersion, "version", "v", false, "Print the version of tiup")
+	rootCmd.Flags().String("binpath", "", "Specify the binary path of component instance")
+	rootCmd.Flags().BoolP("version", "v", false, "Print the version of tiup")
 
 	rootCmd.AddCommand(
 		newInstallCmd(),
@@ -148,37 +198,87 @@ the latest stable version will be downloaded from the repository.`,
 		newStatusCmd(),
 		newCleanCmd(),
 		newMirrorCmd(),
-		newTelemetryCmd(),
-		newCompletionCmd(),
 		newEnvCmd(),
+		newHistoryCmd(),
+		newLinkCmd(),
+		newUnlinkCmd(),
 	)
+}
 
-	originHelpFunc := rootCmd.HelpFunc()
-	rootCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
-		if len(args) < 2 {
-			originHelpFunc(cmd, args)
-			return
-		}
-		env, err := environment.InitEnv(repoOpts)
-		cmd, n, e := cmd.Root().Find(args)
-		if (cmd == rootCmd || e != nil) && len(n) > 0 && err == nil {
-			externalHelp(env, n[0], n[1:]...)
-		} else {
-			cmd.InitDefaultHelpFlag() // make possible 'help' flag to be shown
-			_ = cmd.Help()
-		}
-	})
+func shouldSkipEnvInit(cmd *cobra.Command, args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
 
-	rootCmd.SetHelpCommand(newHelpCmd())
-	// If env is inited before, localdata.InitProfile() will return a valid profile
-	// or it will return an invalid one but still print usage
-	rootCmd.SetUsageTemplate(usageTemplate(localdata.InitProfile()))
+	switch args[0] {
+	case "--help", "-h":
+		return !isMirrorCloneCommand(cmd)
+	case "--version", "-v":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMirrorCloneCommand(cmd *cobra.Command) bool {
+	return cmd != nil && cmd.Name() == "clone" && cmd.HasParent() && cmd.Parent().Name() == "mirror"
+}
+
+type rootComponentArgs struct {
+	binPath       string
+	forcePull     bool
+	componentSpec string
+	componentArgs []string
+}
+
+func parseRootComponentArgs(args []string, binPath string, forcePull bool) rootComponentArgs {
+	if len(args) < 1 {
+		return rootComponentArgs{}
+	}
+
+	componentSpec := args[0]
+	componentArgs := args[1:]
+	if len(componentArgs) > 0 && componentArgs[0] == "--" {
+		componentArgs = componentArgs[1:]
+	}
+
+	return rootComponentArgs{
+		binPath:       binPath,
+		forcePull:     forcePull,
+		componentSpec: componentSpec,
+		componentArgs: componentArgs,
+	}
 }
 
 // Execute parses the command line arguments and calls proper functions
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(color.RedString("Error: %v", err))
-		os.Exit(1)
+	start := time.Now()
+	code := 0
+
+	err := rootCmd.Execute()
+	if err != nil {
+		// use exit code from component
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			fmt.Fprintln(os.Stderr, color.RedString("Error: %v", err))
+			code = 1
+		}
+	}
+
+	// record TiUP execution history
+	env := environment.GlobalEnv()
+	if env != nil {
+		err := environment.HistoryRecord(env, os.Args, start, code)
+		if err != nil {
+			log.Warnf("Recording TiUP execution history failed: %v", err)
+		}
+	}
+
+	color.Unset()
+
+	if code != 0 {
+		os.Exit(code)
 	}
 }

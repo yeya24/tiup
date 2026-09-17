@@ -13,13 +13,11 @@
 
 package install
 
-import (
-	"os"
-)
+import "github.com/pingcap/tiup/pkg/utils"
 
 // WriteLocalInstallScript writes the install script into specified path
 func WriteLocalInstallScript(path string) error {
-	return os.WriteFile(path, []byte(script), 0755)
+	return utils.WriteFile(path, []byte(script), 0755)
 }
 
 var script = `#!/bin/sh
@@ -46,11 +44,6 @@ if [ -z "$arch" ]; then
     exit 1
 fi
 
-if [ "$os-$arch" == "darwin-arm64" ]; then
-    echo "Architecture darwin-arm64 not supported." >&2
-    exit 1
-fi
-
 if [ -z "$TIUP_HOME" ]; then
     TIUP_HOME=$HOME/.tiup
 fi
@@ -68,6 +61,19 @@ install_binary() {
   return 0
 }
 
+check_depends() {
+    pass=0
+    command -v tar >/dev/null || {
+        echo "Dependency check failed: please install 'tar' before proceeding."
+        pass=1
+    }
+    return $pass
+}
+
+if ! check_depends; then
+    exit 1
+fi
+
 if ! install_binary; then
     echo "Failed to download and/or extract tiup archive."
     exit 1
@@ -75,10 +81,15 @@ fi
 
 chmod 755 "$bin_dir/tiup"
 
-"$bin_dir/tiup" mirror set ${script_dir}
+# set mirror to the local path
+"$bin_dir/tiup" mirror set ${script_dir} --silent
 
 bold=$(tput bold 2>/dev/null)
+green=$(tput setaf 2 2>/dev/null)
+cyan=$(tput setaf 6 2>/dev/null)
 sgr0=$(tput sgr0 2>/dev/null)
+
+echo
 
 # Reference: https://stackoverflow.com/questions/14637979/how-to-permanently-set-path-on-linux-unix
 shell=$(echo $SHELL | awk 'BEGIN {FS="/";} { print $NF }')
@@ -93,18 +104,23 @@ else
     PROFILE=${HOME}/.profile
 fi
 echo "Shell profile:  ${bold}$PROFILE${sgr0}"
-
+echo
+echo "${bold}${green}✔ ${sgr0}Installed in ${bold}$bin_dir/tiup${sgr0}"
 case :$PATH: in
-    *:$bin_dir:*) : "PATH already contains $bin_dir" ;;
-    *) printf 'export PATH=%s:$PATH\n' "$bin_dir" >> "$PROFILE"
-        echo "$PROFILE has been modified to to add tiup to PATH"
-        echo "open a new terminal or ${bold}source ${PROFILE}${sgr0} to use it"
+    *:$bin_dir:*) echo "${bold}${green}✔ ${sgr0}tiup PATH is already set, skip" ;;
+    *) printf '\nexport PATH=%s:$PATH\n' "$bin_dir" >> "$PROFILE"
+        echo "${bold}${green}✔ ${sgr0}Added tiup PATH into ${bold}${shell}${sgr0} profile"
         ;;
 esac
+echo
+echo "${bold}tiup is installed now${sgr0} 🎉"
+echo
+echo Next step:
+echo
+echo "  1: To make PATH change effective, restart your shell or execute:"
+echo "     ${bold}${cyan}source ${PROFILE}${sgr0}"
+echo
+echo "  2: Start a local TiDB for development:"
+echo "     ${bold}${cyan}tiup playground${sgr0}"
 
-echo "Installed path: ${bold}$bin_dir/tiup${sgr0}"
-echo "==============================================="
-echo "1. ${bold}source ${PROFILE}${sgr0}"
-echo "2. Have a try:   ${bold}tiup playground${sgr0}"
-echo "==============================================="
 `

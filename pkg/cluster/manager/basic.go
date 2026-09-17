@@ -17,26 +17,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/joomcode/errorx"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cliutil"
+	"github.com/pingcap/tiup/pkg/cluster/clusterutil"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/tidbver"
+	"github.com/pingcap/tiup/pkg/tui"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // EnableCluster enable/disable the service in a cluster
-func (m *Manager) EnableCluster(name string, options operator.Options, isEnable bool) error {
+func (m *Manager) EnableCluster(name string, gOpt operator.Options, isEnable bool) error {
 	if isEnable {
-		log.Infof("Enabling cluster %s...", name)
+		m.logger.Infof("Enabling cluster %s...", name)
 	} else {
-		log.Infof("Disabling cluster %s...", name)
+		m.logger.Infof("Disabling cluster %s...", name)
 	}
 
 	metadata, err := m.meta(name)
@@ -47,21 +52,29 @@ func (m *Manager) EnableCluster(name string, options operator.Options, isEnable 
 	topo := metadata.GetTopology()
 	base := metadata.GetBaseMeta()
 
-	b := m.sshTaskBuilder(name, topo, base.User, options)
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
 
 	if isEnable {
 		b = b.Func("EnableCluster", func(ctx context.Context) error {
-			return operator.Enable(ctx, topo, options, isEnable)
+			return operator.Enable(ctx, topo, gOpt, isEnable)
 		})
 	} else {
 		b = b.Func("DisableCluster", func(ctx context.Context) error {
-			return operator.Enable(ctx, topo, options, isEnable)
+			return operator.Enable(ctx, topo, gOpt, isEnable)
 		})
 	}
 
 	t := b.Build()
 
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
+	if err := t.Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -70,17 +83,22 @@ func (m *Manager) EnableCluster(name string, options operator.Options, isEnable 
 	}
 
 	if isEnable {
-		log.Infof("Enabled cluster `%s` successfully", name)
+		m.logger.Infof("Enabled cluster `%s` successfully", name)
 	} else {
-		log.Infof("Disabled cluster `%s` successfully", name)
+		m.logger.Infof("Disabled cluster `%s` successfully", name)
 	}
 
 	return nil
 }
 
 // StartCluster start the cluster with specified name.
-func (m *Manager) StartCluster(name string, options operator.Options, fn ...func(b *task.Builder, metadata spec.Metadata)) error {
-	log.Infof("Starting cluster %s...", name)
+func (m *Manager) StartCluster(name string, gOpt operator.Options, restoreLeader bool, fn ...func(b *task.Builder, metadata spec.Metadata)) error {
+	m.logger.Infof("Starting cluster %s...", name)
+
+	// check locked
+	if err := m.specManager.ScaleOutLockedErr(name); err != nil {
+		return err
+	}
 
 	metadata, err := m.meta(name)
 	if err != nil && !errors.Is(perrs.Cause(err), meta.ErrValidate) {
@@ -95,10 +113,14 @@ func (m *Manager) StartCluster(name string, options operator.Options, fn ...func
 		return err
 	}
 
-	b := m.sshTaskBuilder(name, topo, base.User, options).
-		Func("StartCluster", func(ctx context.Context) error {
-			return operator.Start(ctx, topo, options, tlsCfg)
-		})
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
+
+	b.Func("StartCluster", func(ctx context.Context) error {
+		return operator.Start(ctx, topo, gOpt, restoreLeader, tlsCfg)
+	})
 
 	for _, f := range fn {
 		f(b, metadata)
@@ -106,7 +128,12 @@ func (m *Manager) StartCluster(name string, options operator.Options, fn ...func
 
 	t := b.Build()
 
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
+	if err := t.Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -114,12 +141,22 @@ func (m *Manager) StartCluster(name string, options operator.Options, fn ...func
 		return perrs.Trace(err)
 	}
 
-	log.Infof("Started cluster `%s` successfully", name)
+	m.logger.Infof("Started cluster `%s` successfully", name)
 	return nil
 }
 
 // StopCluster stop the cluster.
-func (m *Manager) StopCluster(name string, options operator.Options, skipConfirm bool) error {
+func (m *Manager) StopCluster(
+	name string,
+	gOpt operator.Options,
+	skipConfirm,
+	evictLeader bool,
+) error {
+	// check locked
+	if err := m.specManager.ScaleOutLockedErr(name); err != nil {
+		return err
+	}
+
 	metadata, err := m.meta(name)
 	if err != nil && !errors.Is(perrs.Cause(err), meta.ErrValidate) {
 		return err
@@ -134,24 +171,34 @@ func (m *Manager) StopCluster(name string, options operator.Options, skipConfirm
 	}
 
 	if !skipConfirm {
-		if err := cliutil.PromptForConfirmOrAbortError(
-			fmt.Sprintf("Will stop the cluster %s with nodes: %s, roles: %s.\nDo you want to continue? [y/N]:",
+		if err := tui.PromptForConfirmOrAbortError(
+			"%s", fmt.Sprintf("Will stop the cluster %s with nodes: %s, roles: %s.\nDo you want to continue? [y/N]:",
 				color.HiYellowString(name),
-				color.HiRedString(strings.Join(options.Nodes, ",")),
-				color.HiRedString(strings.Join(options.Roles, ",")),
+				color.HiRedString(strings.Join(gOpt.Nodes, ",")),
+				color.HiRedString(strings.Join(gOpt.Roles, ",")),
 			),
 		); err != nil {
 			return err
 		}
 	}
 
-	t := m.sshTaskBuilder(name, topo, base.User, options).
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
+
+	t := b.
 		Func("StopCluster", func(ctx context.Context) error {
-			return operator.Stop(ctx, topo, options, tlsCfg)
+			return operator.Stop(ctx, topo, gOpt, evictLeader, tlsCfg)
 		}).
 		Build()
 
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
+	if err := t.Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -159,12 +206,17 @@ func (m *Manager) StopCluster(name string, options operator.Options, skipConfirm
 		return perrs.Trace(err)
 	}
 
-	log.Infof("Stopped cluster `%s` successfully", name)
+	m.logger.Infof("Stopped cluster `%s` successfully", name)
 	return nil
 }
 
 // RestartCluster restart the cluster.
-func (m *Manager) RestartCluster(name string, options operator.Options, skipConfirm bool) error {
+func (m *Manager) RestartCluster(name string, gOpt operator.Options, skipConfirm bool) error {
+	// check locked
+	if err := m.specManager.ScaleOutLockedErr(name); err != nil {
+		return err
+	}
+
 	metadata, err := m.meta(name)
 	if err != nil && !errors.Is(perrs.Cause(err), meta.ErrValidate) {
 		return err
@@ -179,24 +231,46 @@ func (m *Manager) RestartCluster(name string, options operator.Options, skipConf
 	}
 
 	if !skipConfirm {
-		if err := cliutil.PromptForConfirmOrAbortError(
-			fmt.Sprintf("Will restart the cluster %s with nodes: %s roles: %s.\nDo you want to continue? [y/N]:",
-				color.HiYellowString(name),
-				color.HiYellowString(strings.Join(options.Nodes, ",")),
-				color.HiYellowString(strings.Join(options.Roles, ",")),
-			),
-		); err != nil {
+		var availabilityMessage string
+		var rolesToRestart string
+		var nodesToRestart string
+		if len(gOpt.Nodes) == 0 && len(gOpt.Roles) == 0 {
+			availabilityMessage = "Cluster will be unavailable"
+			rolesToRestart = "all"
+			nodesToRestart = "all"
+		} else {
+			availabilityMessage = fmt.Sprintf("Cluster functionality related to nodes: %s roles: %s will be unavailable", strings.Join(gOpt.Nodes, ","), strings.Join(gOpt.Roles, ","))
+			nodesToRestart = strings.Join(gOpt.Nodes, ",")
+			rolesToRestart = strings.Join(gOpt.Roles, ",")
+		}
+
+		confirmationMessage := fmt.Sprintf("Will restart the cluster %s with nodes: %s roles: %s.\n%s\nDo you want to continue? [y/N]:",
+			color.HiYellowString(name),
+			color.HiYellowString(nodesToRestart),
+			color.HiYellowString(rolesToRestart),
+			availabilityMessage,
+		)
+		if err := tui.PromptForConfirmOrAbortError("%s", confirmationMessage); err != nil {
 			return err
 		}
 	}
 
-	t := m.sshTaskBuilder(name, topo, base.User, options).
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
+	t := b.
 		Func("RestartCluster", func(ctx context.Context) error {
-			return operator.Restart(ctx, topo, options, tlsCfg)
+			return operator.Restart(ctx, topo, gOpt, tlsCfg)
 		}).
 		Build()
 
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
+	if err := t.Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -204,6 +278,121 @@ func (m *Manager) RestartCluster(name string, options operator.Options, skipConf
 		return perrs.Trace(err)
 	}
 
-	log.Infof("Restarted cluster `%s` successfully", name)
+	m.logger.Infof("Restarted cluster `%s` successfully", name)
 	return nil
+}
+
+// getMonitorHosts  get the instance to ignore list if it marks itself as ignore_exporter
+func getMonitorHosts(topo spec.Topology) (map[string]hostInfo, set.StringSet) {
+	// monitor
+	uniqueHosts := make(map[string]hostInfo) // host -> ssh-port, os, arch
+	noAgentHosts := set.NewStringSet()
+	topo.IterInstance(func(inst spec.Instance) {
+		// add the instance to ignore list if it marks itself as ignore_exporter
+		if inst.IgnoreMonitorAgent() {
+			noAgentHosts.Insert(inst.GetManageHost())
+		}
+
+		if _, found := uniqueHosts[inst.GetManageHost()]; !found {
+			uniqueHosts[inst.GetManageHost()] = hostInfo{
+				ssh:  inst.GetSSHPort(),
+				os:   inst.OS(),
+				arch: inst.Arch(),
+			}
+		}
+	})
+
+	return uniqueHosts, noAgentHosts
+}
+
+// checkTiFlashWithTLS check tiflash version
+func checkTiFlashWithTLS(topo spec.Topology, version string) error {
+	if clusterSpec, ok := topo.(*spec.Specification); ok {
+		if clusterSpec.GlobalOptions.TLSEnabled {
+			if (!tidbver.TiFlashSupportTLS(version) &&
+				len(clusterSpec.TiFlashServers) > 0) &&
+				version != utils.NightlyVersionAlias {
+				return fmt.Errorf("TiFlash %s is not supported in TLS enabled cluster", version)
+			}
+		}
+	}
+	return nil
+}
+
+// BackupClusterMeta backup cluster meta to given filepath
+func (m *Manager) BackupClusterMeta(clusterName, filePath string) error {
+	exist, err := m.specManager.Exist(clusterName)
+	if err != nil {
+		return err
+	}
+	if !exist {
+		return fmt.Errorf("cluster %s does not exist", clusterName)
+	}
+	// check locked
+	if err := m.specManager.ScaleOutLockedErr(clusterName); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	return utils.Tar(f, m.specManager.Path(clusterName))
+}
+
+// RestoreClusterMeta restore cluster meta by given filepath
+func (m *Manager) RestoreClusterMeta(clusterName, filePath string, skipConfirm bool) error {
+	if err := clusterutil.ValidateClusterNameOrError(clusterName); err != nil {
+		return err
+	}
+
+	fi, err := os.Stat(m.specManager.Path(clusterName))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return perrs.AddStack(err)
+		}
+		m.logger.Infof("%s", fmt.Sprintf("meta of cluster %s didn't exist before restore", clusterName))
+		skipConfirm = true
+	} else {
+		m.logger.Warnf("%s", color.HiRedString(tui.ASCIIArtWarning))
+
+		exist, err := m.specManager.Exist(clusterName)
+		if err != nil {
+			return err
+		}
+		if exist {
+			m.logger.Infof("%s", fmt.Sprintf("the exist meta.yaml of cluster %s was last modified at %s", clusterName, color.HiYellowString(fi.ModTime().Format(time.RFC3339))))
+		} else {
+			m.logger.Infof("%s", fmt.Sprintf("the meta.yaml of cluster %s does not exist", clusterName))
+		}
+	}
+	fi, err = os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+	m.logger.Warnf("the given tarball was last modified at %s", color.HiYellowString(fi.ModTime().Format(time.RFC3339)))
+	if !skipConfirm {
+		if err := tui.PromptForAnswerOrAbortError(
+			"Yes, I know my cluster meta will be be overridden.",
+			"%s", fmt.Sprintf("This operation will override topology file and other meta file of %s cluster %s .",
+				m.sysName,
+				color.HiYellowString(clusterName),
+			)+"\nAre you sure to continue?",
+		); err != nil {
+			return err
+		}
+		m.logger.Infof("Restoring cluster meta files...")
+	}
+	err = os.RemoveAll(m.specManager.Path(clusterName))
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	err = utils.Untar(f, m.specManager.Path(clusterName))
+	if err == nil {
+		m.logger.Infof("%s", fmt.Sprintf("restore meta of cluster %s successfully.", clusterName))
+	}
+	return err
 }

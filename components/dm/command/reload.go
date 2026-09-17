@@ -14,6 +14,8 @@
 package command
 
 import (
+	"slices"
+
 	perrs "github.com/pingcap/errors"
 	"github.com/pingcap/tiup/components/dm/spec"
 	"github.com/spf13/cobra"
@@ -37,6 +39,14 @@ func newReloadCmd() *cobra.Command {
 
 			return cm.Reload(clusterName, gOpt, skipRestart, skipConfirm)
 		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			switch len(args) {
+			case 0:
+				return shellCompGetClusterName(cm, toComplete)
+			default:
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+		},
 	}
 
 	cmd.Flags().StringSliceVarP(&gOpt.Roles, "role", "R", nil, "Only reload specified roles")
@@ -48,13 +58,7 @@ func newReloadCmd() *cobra.Command {
 
 func validRoles(roles []string) error {
 	for _, r := range roles {
-		match := false
-		for _, has := range spec.AllDMComponentNames() {
-			if r == has {
-				match = true
-				break
-			}
-		}
+		match := slices.Contains(spec.AllDMComponentNames(), r)
 
 		if !match {
 			return perrs.Errorf("not valid role: %s, should be one of: %v", r, spec.AllDMComponentNames())

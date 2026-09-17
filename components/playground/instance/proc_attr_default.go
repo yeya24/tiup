@@ -12,11 +12,10 @@
 // limitations under the License.
 //
 //go:build !linux
-// +build !linux
 
 package instance
 
 import "syscall"
 
 // SysProcAttr to be use for every Process we start.
-var SysProcAttr *syscall.SysProcAttr = nil
+var SysProcAttr *syscall.SysProcAttr

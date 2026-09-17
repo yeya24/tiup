@@ -16,7 +16,6 @@ package task
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/google/uuid"
@@ -27,20 +26,23 @@ import (
 	"github.com/pingcap/tiup/pkg/cluster/template/config"
 	"github.com/pingcap/tiup/pkg/cluster/template/scripts"
 	system "github.com/pingcap/tiup/pkg/cluster/template/systemd"
-	"github.com/pingcap/tiup/pkg/logger/log"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/utils"
 	"go.uber.org/zap"
 )
 
 // MonitoredConfig is used to generate the monitor node configuration
 type MonitoredConfig struct {
-	name       string
-	component  string
-	host       string
-	globResCtl meta.ResourceControl
-	options    *spec.MonitoredOptions
-	deployUser string
-	paths      meta.DirPaths
+	name        string
+	component   string
+	host        string
+	globResCtl  meta.ResourceControl
+	options     *spec.MonitoredOptions
+	deployUser  string
+	tlsEnabled  bool
+	paths       meta.DirPaths
+	systemdMode spec.SystemdMode
 }
 
 // Execute implements the Task interface
@@ -55,30 +57,28 @@ func (m *MonitoredConfig) Execute(ctx context.Context) error {
 		return ErrNoExecutor
 	}
 
-	if err := os.MkdirAll(m.paths.Cache, 0755); err != nil {
+	if err := utils.MkdirAll(m.paths.Cache, 0755); err != nil {
 		return err
 	}
 
-	if err := m.syncMonitoredSystemConfig(ctx, exec, m.component, ports[m.component]); err != nil {
+	if err := m.syncMonitoredSystemConfig(ctx, exec, m.component, ports[m.component], m.systemdMode); err != nil {
 		return err
 	}
 
 	var cfg template.ConfigGenerator
 	switch m.component {
 	case spec.ComponentNodeExporter:
-		if err := m.syncBlackboxConfig(ctx, exec, config.NewBlackboxConfig()); err != nil {
+		if err := m.syncBlackboxConfig(ctx, exec, config.NewBlackboxConfig(m.paths.Deploy, m.tlsEnabled)); err != nil {
 			return err
 		}
-		cfg = scripts.NewNodeExporterScript(
-			m.paths.Deploy,
-			m.paths.Log,
-		).WithPort(uint64(m.options.NodeExporterPort)).
+		cfg = scripts.
+			NewNodeExporterScript(m.paths.Deploy, m.paths.Log).
+			WithPort(uint64(m.options.NodeExporterPort)).
 			WithNumaNode(m.options.NumaNode)
 	case spec.ComponentBlackboxExporter:
-		cfg = scripts.NewBlackboxExporterScript(
-			m.paths.Deploy,
-			m.paths.Log,
-		).WithPort(uint64(m.options.BlackboxExporterPort))
+		cfg = scripts.
+			NewBlackboxExporterScript(m.paths.Deploy, m.paths.Log).
+			WithPort(uint64(m.options.BlackboxExporterPort))
 	default:
 		return fmt.Errorf("unknown monitored component %s", m.component)
 	}
@@ -86,11 +86,11 @@ func (m *MonitoredConfig) Execute(ctx context.Context) error {
 	return m.syncMonitoredScript(ctx, exec, m.component, cfg)
 }
 
-func (m *MonitoredConfig) syncMonitoredSystemConfig(ctx context.Context, exec ctxt.Executor, comp string, port int) (err error) {
+func (m *MonitoredConfig) syncMonitoredSystemConfig(ctx context.Context, exec ctxt.Executor, comp string, port int, systemdMode spec.SystemdMode) (err error) {
 	sysCfg := filepath.Join(m.paths.Cache, fmt.Sprintf("%s-%s-%d.service", comp, m.host, port))
 
 	// insert checkpoint
-	point := checkpoint.Acquire(ctx, spec.CopyConfigFile, map[string]interface{}{"config-file": sysCfg})
+	point := checkpoint.Acquire(ctx, spec.CopyConfigFile, map[string]any{"config-file": sysCfg})
 	defer func() {
 		point.Release(err, zap.String("config-file", sysCfg))
 	}()
@@ -98,12 +98,20 @@ func (m *MonitoredConfig) syncMonitoredSystemConfig(ctx context.Context, exec ct
 		return nil
 	}
 
+	if len(systemdMode) == 0 {
+		systemdMode = spec.SystemMode
+	}
+
 	resource := spec.MergeResourceControl(m.globResCtl, m.options.ResourceControl)
 	systemCfg := system.NewConfig(comp, m.deployUser, m.paths.Deploy).
 		WithMemoryLimit(resource.MemoryLimit).
 		WithCPUQuota(resource.CPUQuota).
+		WithLimitCORE(resource.LimitCORE).
+		WithTimeoutStartSec(resource.TimeoutStartSec).
+		WithTimeoutStopSec(resource.TimeoutStopSec).
 		WithIOReadBandwidthMax(resource.IOReadBandwidthMax).
-		WithIOWriteBandwidthMax(resource.IOWriteBandwidthMax)
+		WithIOWriteBandwidthMax(resource.IOWriteBandwidthMax).
+		WithSystemdMode(string(systemdMode))
 
 	// blackbox_exporter needs cap_net_raw to send ICMP ping packets
 	if comp == spec.ComponentBlackboxExporter {
@@ -114,18 +122,35 @@ func (m *MonitoredConfig) syncMonitoredSystemConfig(ctx context.Context, exec ct
 		return err
 	}
 	tgt := filepath.Join("/tmp", comp+"_"+uuid.New().String()+".service")
-	if err := exec.Transfer(ctx, sysCfg, tgt, false); err != nil {
+	if err := exec.Transfer(ctx, sysCfg, tgt, false, 0, false); err != nil {
 		return err
 	}
-	if outp, errp, err := exec.Execute(ctx, fmt.Sprintf("mv %s /etc/systemd/system/%s-%d.service", tgt, comp, port), true); err != nil {
+	systemdDir := "/etc/systemd/system/"
+	sudo := true
+	if systemdMode == spec.UserMode {
+		systemdDir = "~/.config/systemd/user/"
+		sudo = false
+	}
+	if outp, errp, err := exec.Execute(ctx, fmt.Sprintf("mv %s %s%s-%d.service", tgt, systemdDir, comp, port), sudo); err != nil {
 		if len(outp) > 0 {
 			fmt.Println(string(outp))
 		}
 		if len(errp) > 0 {
-			log.Errorf(string(errp))
+			ctx.Value(logprinter.ContextKeyLogger).(*logprinter.Logger).
+				Errorf("%s", string(errp))
 		}
 		return err
 	}
+
+	// restorecon restores SELinux Contexts
+	// Check with: ls -lZ /path/to/file
+	// If the context is wrong systemctl will complain about a missing unit file
+	// Note that we won't check for errors here because:
+	// - We don't support SELinux in Enforcing mode
+	// - restorecon might not be available (Ubuntu doesn't install SELinux tools by default)
+	cmd := fmt.Sprintf("restorecon %s%s-%d.service", systemdDir, comp, port)
+	exec.Execute(ctx, cmd, sudo) //nolint
+
 	return nil
 }
 
@@ -135,7 +160,7 @@ func (m *MonitoredConfig) syncMonitoredScript(ctx context.Context, exec ctxt.Exe
 		return err
 	}
 	dst := filepath.Join(m.paths.Deploy, "scripts", fmt.Sprintf("run_%s.sh", comp))
-	if err := exec.Transfer(ctx, fp, dst, false); err != nil {
+	if err := exec.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 	if _, _, err := exec.Execute(ctx, "chmod +x "+dst, false); err != nil {
@@ -151,7 +176,7 @@ func (m *MonitoredConfig) syncBlackboxConfig(ctx context.Context, exec ctxt.Exec
 		return err
 	}
 	dst := filepath.Join(m.paths.Deploy, "conf", "blackbox.yml")
-	return exec.Transfer(ctx, fp, dst, false)
+	return exec.Transfer(ctx, fp, dst, false, 0, false)
 }
 
 // Rollback implements the Task interface

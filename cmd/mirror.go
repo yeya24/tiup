@@ -15,6 +15,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,11 +27,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fatih/color"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/environment"
 	"github.com/pingcap/tiup/pkg/localdata"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/repository"
 	"github.com/pingcap/tiup/pkg/repository/model"
 	ru "github.com/pingcap/tiup/pkg/repository/utils"
@@ -69,8 +69,10 @@ of components or the repository itself.`,
 		newMirrorShowCmd(),
 		newMirrorSetCmd(),
 		newMirrorModifyCmd(),
+		newMirrorRenewCmd(),
 		newMirrorGrantCmd(),
 		newMirrorRotateCmd(),
+		newTransferOwnerCmd(),
 	)
 
 	return cmd
@@ -102,7 +104,7 @@ func newMirrorSignCmd() *cobra.Command {
 
 			if strings.HasPrefix(args[0], "http") {
 				client := utils.NewHTTPClient(time.Duration(timeout)*time.Second, nil)
-				data, err := client.Get(args[0])
+				data, err := client.Get(context.TODO(), args[0])
 				if err != nil {
 					return err
 				}
@@ -111,7 +113,7 @@ func newMirrorSignCmd() *cobra.Command {
 					return err
 				}
 
-				if _, err = client.Post(args[0], bytes.NewBuffer(data)); err != nil {
+				if _, err = client.Post(context.TODO(), args[0], bytes.NewBuffer(data)); err != nil {
 					return err
 				}
 
@@ -127,7 +129,7 @@ func newMirrorSignCmd() *cobra.Command {
 				return err
 			}
 
-			if err = os.WriteFile(args[0], data, 0664); err != nil {
+			if err = utils.WriteFile(args[0], data, 0664); err != nil {
 				return perrs.Annotatef(err, "write manifest file %s", args[0])
 			}
 
@@ -158,8 +160,9 @@ func newMirrorShowCmd() *cobra.Command {
 // the `mirror set` sub command
 func newMirrorSetCmd() *cobra.Command {
 	var (
-		root  string
-		reset bool
+		root   string
+		reset  bool
+		silent bool
 	)
 	cmd := &cobra.Command{
 		Use:   "set <mirror-addr>",
@@ -178,17 +181,29 @@ The root manifest in $TIUP_HOME will be replaced with the one in given repositor
 			} else {
 				addr = args[0]
 			}
+			// expand relative path
+			if !strings.HasPrefix(addr, "http") {
+				var err error
+				addr, err = filepath.Abs(addr)
+				if err != nil {
+					return err
+				}
+			}
+
 			profile := localdata.InitProfile()
 			if err := profile.ResetMirror(addr, root); err != nil {
 				log.Errorf("Failed to set mirror: %s\n", err.Error())
 				return err
 			}
-			fmt.Printf("Successfully set mirror to %s\n", addr)
+			if !silent {
+				fmt.Printf("Successfully set mirror to %s\n", addr)
+			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&root, "root", "r", root, "Specify the path of `root.json`")
 	cmd.Flags().BoolVar(&reset, "reset", false, "Reset mirror to use the default address.")
+	cmd.Flags().BoolVar(&silent, "silent", false, "Skip non-warning messages.")
 
 	return cmd
 }
@@ -213,7 +228,7 @@ func newMirrorGrantCmd() *cobra.Command {
 				name = id
 			}
 
-			// the privPath can point to a public key becase the Public method of KeyInfo works on both priv and pub key
+			// the privPath can point to a public key because the Public method of KeyInfo works on both priv and pub keys
 			privKey, err := loadPrivKey(privPath)
 			if err != nil {
 				return err
@@ -222,14 +237,22 @@ func newMirrorGrantCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			keyID, err := pubKey.ID()
+			if err != nil {
+				return err
+			}
 
 			env := environment.GlobalEnv()
-			return env.V1Repository().Mirror().Grant(id, name, pubKey)
+			err = env.V1Repository().Mirror().Grant(id, name, pubKey)
+			if err == nil {
+				log.Infof("Granted new owner %s(%s) with public key %s.", id, name, keyID)
+			}
+			return err
 		},
 	}
 
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Specify the name of the owner, default: id of the owner")
-	cmd.Flags().StringVarP(&privPath, "key", "k", "", "Specify the private key path of the owner")
+	cmd.Flags().StringVarP(&privPath, "key", "k", "", "Specify the path to the private or public key of the owner")
 
 	return cmd
 }
@@ -256,7 +279,7 @@ func newMirrorModifyCmd() *cobra.Command {
 			env := environment.GlobalEnv()
 
 			comp, ver := environment.ParseCompVersion(component)
-			m, err := env.V1Repository().FetchComponentManifest(comp, true)
+			m, err := env.V1Repository().GetComponentManifest(comp, true)
 			if err != nil {
 				return err
 			}
@@ -313,29 +336,146 @@ func newMirrorModifyCmd() *cobra.Command {
 	return cmd
 }
 
+// the `mirror renew` sub command
+func newMirrorRenewCmd() *cobra.Command {
+	var privPath string
+	var days int
+
+	cmd := &cobra.Command{
+		Use:   "renew <component> [flags]",
+		Short: "Renew the manifest of a published component.",
+		Long:  "Renew the manifest of a published component, bump version and extend its expire time.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 1 {
+				return cmd.Help()
+			}
+
+			component := args[0]
+
+			env := environment.GlobalEnv()
+
+			comp, _ := environment.ParseCompVersion(component)
+			m, err := env.V1Repository().GetComponentManifest(comp, true)
+			if err != nil {
+				// ignore manifest expiration error
+				if !v1manifest.IsExpirationError(perrs.Cause(err)) {
+					return err
+				}
+				fmt.Printf("Ignoring expiration error: %s", err)
+			}
+
+			if m == nil {
+				return errors.New("got nil manifest")
+			}
+
+			if days > 0 {
+				v1manifest.RenewManifest(m, time.Now(), time.Hour*24*time.Duration(days))
+			} else {
+				v1manifest.RenewManifest(m, time.Now())
+			}
+
+			manifest, err := sign(privPath, m)
+			if err != nil {
+				return err
+			}
+
+			return env.V1Repository().Mirror().Publish(manifest, &model.PublishInfo{})
+		},
+	}
+
+	cmd.Flags().StringVarP(&privPath, "key", "k", "", "private key path")
+	cmd.Flags().IntVar(&days, "days", 0, "after how many days the manifest expires, 0 means builtin default values of manifests")
+	return cmd
+}
+
+// the `mirror transfer-owner` sub command
+func newTransferOwnerCmd() *cobra.Command {
+	addr := "0.0.0.0:8080"
+
+	cmd := &cobra.Command{
+		Use:   "transfer-owner <component> <new-owner>",
+		Short: "Transfer component to another owner",
+		Long:  "Transfer component to another owner, this must be done on the server.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 2 {
+				return cmd.Help()
+			}
+
+			component := args[0]
+			newOwnerName := args[1]
+			env := environment.GlobalEnv()
+
+			// read current manifests
+			index, err := env.V1Repository().FetchIndexManifest()
+			if err != nil {
+				return err
+			}
+			newOwner, found := index.Owners[newOwnerName]
+			if !found {
+				return fmt.Errorf("new owner '%s' is not in the available owner list", newOwnerName)
+			}
+
+			m, err := env.V1Repository().GetComponentManifest(component, true)
+			if err != nil {
+				return err
+			}
+			v1manifest.RenewManifest(m, time.Now())
+
+			// validate new owner's authorization
+			newCompManifest, err := rotate.ServeComponent(addr, &newOwner, m)
+			if err != nil {
+				return err
+			}
+
+			// update owner info
+			return env.V1Repository().Mirror().Publish(newCompManifest, &model.PublishInfo{
+				Owner: newOwnerName,
+			})
+		},
+	}
+
+	cmd.Flags().StringVarP(&addr, "addr", "", addr, "listen address:port when starting the temp server for signing")
+
+	return cmd
+}
+
 // the `mirror rotate` sub command
 func newMirrorRotateCmd() *cobra.Command {
 	addr := "0.0.0.0:8080"
+	keyDir := ""
 
 	cmd := &cobra.Command{
 		Use:   "rotate",
 		Short: "Rotate root.json",
 		Long:  "Rotate root.json make it possible to modify root.json",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			e, err := environment.InitEnv(repoOpts, repository.MirrorOptions{KeyDir: keyDir})
+			if err != nil {
+				if errors.Is(perrs.Cause(err), v1manifest.ErrLoadManifest) {
+					log.Warnf("Please check for root manifest file, you may download one from the repository mirror, or try `tiup mirror set` to force reset it.")
+				}
+				return err
+			}
+			environment.SetGlobalEnv(e)
+
 			root, err := editLatestRootManifest()
 			if err != nil {
 				return err
 			}
 
-			manifest, err := rotate.Serve(addr, root)
+			manifest, err := rotate.ServeRoot(addr, root)
 			if err != nil {
 				return err
 			}
 
 			return environment.GlobalEnv().V1Repository().Mirror().Rotate(manifest)
 		},
+		PostRunE: func(cmd *cobra.Command, args []string) error {
+			return environment.GlobalEnv().Close()
+		},
 	}
 	cmd.Flags().StringVarP(&addr, "addr", "", addr, "listen address:port when starting the temp server for rotating")
+	cmd.Flags().StringVarP(&keyDir, "key-dir", "", keyDir, "specify the directory where stores the private keys")
 
 	return cmd
 }
@@ -538,15 +678,14 @@ func doPublish(
 ) error {
 	env := environment.GlobalEnv()
 	env.V1Repository().PurgeTimestamp()
-	m, err := env.V1Repository().FetchComponentManifest(component, true)
+	m, err := env.V1Repository().GetComponentManifest(component, true)
 	if err != nil {
-		if perrs.Cause(err) == repository.ErrUnknownComponent {
-			fmt.Printf("Creating component %s\n", component)
-			publishInfo.Stand = &standalone
-			publishInfo.Hide = &hidden
-		} else {
+		if perrs.Cause(err) != repository.ErrUnknownComponent {
 			return err
 		}
+		fmt.Printf("Creating component %s\n", component)
+		publishInfo.Stand = &standalone
+		publishInfo.Hide = &hidden
 	} else if flagSet.Exist("standalone") || flagSet.Exist("hide") {
 		fmt.Println("This is not a new component, --standalone and --hide flag will be omitted")
 	}
@@ -678,7 +817,7 @@ func newMirrorGenkeyCmd() *cobra.Command {
 // the `mirror init` sub command
 func newMirrorInitCmd() *cobra.Command {
 	var (
-		keyDir string // Directory to write genreated key files
+		keyDir string // Directory to write generated key files
 	)
 	cmd := &cobra.Command{
 		Use:   "init <path>",
@@ -729,7 +868,7 @@ func initRepo(path, keyDir string) error {
 		return err
 	}
 	log.Infof("New repository initialized at \"%s\", private keys are stored in \"%s\".", path, keyDir)
-	log.Infof("Use `tiup mirror set` command to set and use the new repository.")
+	log.Infof("Use `%s` command to set and use the new repository.", color.CyanString("tiup mirror set %s", path))
 	return nil
 }
 
@@ -778,12 +917,11 @@ func newMirrorCloneCmd() *cobra.Command {
 	var (
 		options     = repository.CloneOptions{Components: map[string]*[]string{}}
 		components  []string
-		repo        *repository.V1Repository
+		repo        repository.Repository
 		initialized bool
 	)
 
 	initMirrorCloneExtraArgs := func(cmd *cobra.Command) error {
-		initialized = true
 		env := environment.GlobalEnv()
 		repo = env.V1Repository()
 		index, err := repo.FetchIndexManifest()
@@ -804,11 +942,13 @@ func newMirrorCloneCmd() *cobra.Command {
 			options.Components[name] = new([]string)
 			cmd.Flags().StringSliceVar(options.Components[name], name, nil, "Specify the versions for component "+name)
 		}
+		initialized = true
 		return nil
 	}
 	cmd := &cobra.Command{
 		Use: "clone <target-dir> [global version]",
-		Example: `  tiup mirror clone /path/to/local --arch amd64,arm --os linux,darwin    # Specify the architectures and OSs
+		Example: `  tiup mirror clone /path/to/local --arch amd64,arm64 --os linux,darwin    # Specify the architectures and OSs
+  tiup mirror clone /path/to/local --os linux v6.1.0 v5.4.0              # Specify multiple versions
   tiup mirror clone /path/to/local --full                                # Build a full local mirror
   tiup mirror clone /path/to/local --tikv v4  --prefix                   # Specify the version via prefix
   tiup mirror clone /path/to/local --tidb all --pd all                   # Download all version for specific component`,
@@ -845,10 +985,6 @@ func newMirrorCloneCmd() *cobra.Command {
 				}
 			}()
 
-			var versionMapper = func(comp string) string {
-				return spec.TiDBComponentVersion(comp, "")
-			}
-
 			// format input versions
 			versionList := make([]string, 0)
 			for _, ver := range args[1:] {
@@ -859,7 +995,7 @@ func newMirrorCloneCmd() *cobra.Command {
 				versionList = append(versionList, v)
 			}
 
-			return repository.CloneMirror(repo, components, versionMapper, args[0], versionList, options)
+			return repository.CloneMirror(repo, components, args[0], versionList, options)
 		},
 	}
 

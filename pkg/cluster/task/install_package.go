@@ -14,6 +14,7 @@
 package task
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"path"
@@ -42,7 +43,7 @@ func (c *InstallPackage) Execute(ctx context.Context) error {
 	dstDir := filepath.Join(c.dstDir, "bin")
 	dstPath := filepath.Join(dstDir, path.Base(c.srcPath))
 
-	err := exec.Transfer(ctx, c.srcPath, dstPath, false)
+	err := exec.Transfer(ctx, c.srcPath, dstPath, false, 0, false)
 	if err != nil {
 		return errors.Annotatef(err, "failed to scp %s to %s:%s", c.srcPath, c.host, dstPath)
 	}
@@ -51,6 +52,9 @@ func (c *InstallPackage) Execute(ctx context.Context) error {
 
 	_, stderr, err := exec.Execute(ctx, cmd, false)
 	if err != nil {
+		if bytes.Contains(stderr, []byte("command not found")) {
+			return errors.Errorf("tar command was not found on %s, please install it", c.host)
+		}
 		return errors.Annotatef(err, "stderr: %s", string(stderr))
 	}
 	return nil

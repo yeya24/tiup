@@ -29,11 +29,11 @@ type TestMetadata struct {
 }
 
 func (m *TestMetadata) SetVersion(s string) {
-	m.BaseMeta.Version = s
+	m.Version = s
 }
 
 func (m *TestMetadata) SetUser(s string) {
-	m.BaseMeta.User = s
+	m.User = s
 }
 
 func (m *TestMetadata) GetTopology() Topology {
@@ -45,6 +45,10 @@ func (m *TestMetadata) GetBaseMeta() *BaseMeta {
 }
 
 func (t *TestTopology) Merge(topo Topology) Topology {
+	panic("not support")
+}
+
+func (t *TestTopology) FillHostArchOrOS(hostArchOrOS map[string]string, fullType FullHostType) error {
 	panic("not support")
 }
 
@@ -93,11 +97,11 @@ func (t *TestTopology) ComponentsByStopOrder() []Component {
 	return nil
 }
 
-func (t *TestTopology) ComponentsByUpdateOrder() []Component {
+func (t *TestTopology) ComponentsByUpdateOrder(curVer string) []Component {
 	return nil
 }
 
-func (t *TestTopology) IterInstance(fn func(instance Instance)) {
+func (t *TestTopology) IterInstance(fn func(instance Instance), concurrency ...int) {
 }
 
 func (t *TestTopology) GetMonitoredOptions() *MonitoredOptions {
@@ -112,6 +116,9 @@ func (t *TestTopology) CountDir(host string, dir string) int {
 	return 0
 }
 
+func (t *TestTopology) GetGrafanaConfig() map[string]string {
+	return nil
+}
 func TestSpec(t *testing.T) {
 	dir, err := os.MkdirTemp("", "test-*")
 	assert.Nil(t, err)

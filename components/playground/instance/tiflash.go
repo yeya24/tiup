@@ -14,174 +14,169 @@
 package instance
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path"
 	"path/filepath"
-	"runtime"
-	"time"
+	"strings"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cluster/api"
-	"github.com/pingcap/tiup/pkg/environment"
-	"github.com/pingcap/tiup/pkg/repository"
+	"github.com/pingcap/tiup/pkg/tidbver"
+	"github.com/pingcap/tiup/pkg/tui/colorstr"
 	"github.com/pingcap/tiup/pkg/utils"
+)
+
+// TiFlashRole is the role of TiFlash.
+type TiFlashRole = string
+
+const (
+	// TiFlashRoleNormal is used when TiFlash is not in disaggregated mode.
+	TiFlashRoleNormal TiFlashRole = "normal"
+
+	// TiFlashRoleDisaggWrite is used when TiFlash is in disaggregated mode and is the write node.
+	TiFlashRoleDisaggWrite TiFlashRole = "write"
+	// TiFlashRoleDisaggCompute is used when TiFlash is in disaggregated mode and is the compute node.
+	TiFlashRoleDisaggCompute TiFlashRole = "compute"
 )
 
 // TiFlashInstance represent a running TiFlash
 type TiFlashInstance struct {
 	instance
-	TCPPort         int
-	ServicePort     int
-	ProxyPort       int
-	ProxyStatusPort int
-	ProxyConfigPath string
+	shOpt           SharedOptions
+	tcpPort         int
+	servicePort     int
+	proxyPort       int
+	proxyStatusPort int
 	pds             []*PDInstance
 	dbs             []*TiDBInstance
-	Process
 }
 
+var _ Instance = &TiFlashInstance{}
+
 // NewTiFlashInstance return a TiFlashInstance
-func NewTiFlashInstance(binPath, dir, host, configPath string, id int, pds []*PDInstance, dbs []*TiDBInstance) *TiFlashInstance {
+func NewTiFlashInstance(role TiFlashRole, shOpt SharedOptions, binPath, dir, host, configPath string, id int, pds []*PDInstance, dbs []*TiDBInstance, version string) *TiFlashInstance {
+	if role != TiFlashRoleNormal && role != TiFlashRoleDisaggWrite && role != TiFlashRoleDisaggCompute {
+		panic(fmt.Sprintf("Unknown TiFlash role %s", role))
+	}
+	if (role == TiFlashRoleDisaggCompute || role == TiFlashRoleDisaggWrite) && shOpt.Mode != ModeCSE && shOpt.Mode != ModeDisAgg && shOpt.Mode != ModeNextGen {
+		panic(fmt.Sprintf("Unsupported disagg role in mode %s", shOpt.Mode))
+	}
+
+	httpPort := 8123
+	if !tidbver.TiFlashNotNeedHTTPPortConfig(version) {
+		httpPort = utils.MustGetFreePort(host, httpPort, shOpt.PortOffset)
+	}
 	return &TiFlashInstance{
+		shOpt: shOpt,
 		instance: instance{
 			BinPath:    binPath,
 			ID:         id,
 			Dir:        dir,
 			Host:       host,
-			Port:       utils.MustGetFreePort(host, 8123),
-			StatusPort: utils.MustGetFreePort(host, 8234),
+			Port:       httpPort,
+			StatusPort: utils.MustGetFreePort(host, 8234, shOpt.PortOffset),
 			ConfigPath: configPath,
+			role:       role,
 		},
-		TCPPort:         utils.MustGetFreePort(host, 9000),
-		ServicePort:     utils.MustGetFreePort(host, 3930),
-		ProxyPort:       utils.MustGetFreePort(host, 20170),
-		ProxyStatusPort: utils.MustGetFreePort(host, 20292),
-		ProxyConfigPath: configPath,
+		tcpPort:         utils.MustGetFreePort(host, 9100, shOpt.PortOffset), // 9000 for default object store port
+		servicePort:     utils.MustGetFreePort(host, 3930, shOpt.PortOffset),
+		proxyPort:       utils.MustGetFreePort(host, 20170, shOpt.PortOffset),
+		proxyStatusPort: utils.MustGetFreePort(host, 20292, shOpt.PortOffset),
 		pds:             pds,
 		dbs:             dbs,
 	}
 }
 
-func getFlashClusterPath(dir string) string {
-	return fmt.Sprintf("%s/flash_cluster_manager", dir)
-}
-
-type scheduleConfig struct {
-	LowSpaceRatio float64 `json:"low-space-ratio"`
-}
-
-type replicateMaxReplicaConfig struct {
-	MaxReplicas int `json:"max-replicas"`
-}
-
-type replicateEnablePlacementRulesConfig struct {
-	EnablePlacementRules string `json:"enable-placement-rules"`
-}
-
 // Addr return the address of tiflash
 func (inst *TiFlashInstance) Addr() string {
-	return fmt.Sprintf("%s:%d", inst.Host, inst.ServicePort)
+	return utils.JoinHostPort(AdvertiseHost(inst.Host), inst.servicePort)
 }
 
-// StatusAddrs implements Instance interface.
-func (inst *TiFlashInstance) StatusAddrs() (addrs []string) {
-	addrs = append(addrs, fmt.Sprintf("%s:%d", inst.Host, inst.StatusPort))
-	addrs = append(addrs, fmt.Sprintf("%s:%d", inst.Host, inst.ProxyStatusPort))
+// MetricAddr implements Instance interface.
+func (inst *TiFlashInstance) MetricAddr() (r MetricAddr) {
+	r.Targets = append(r.Targets, utils.JoinHostPort(inst.Host, inst.StatusPort))
+	r.Targets = append(r.Targets, utils.JoinHostPort(inst.Host, inst.proxyStatusPort))
 	return
 }
 
 // Start calls set inst.cmd and Start
-func (inst *TiFlashInstance) Start(ctx context.Context, version utils.Version) error {
+func (inst *TiFlashInstance) Start(ctx context.Context) error {
+	// If inst.Version does not meet the new start mode, use old start mode for backward compatibility.
+	// If inst.Version is empty, it means the tiflash is started by specific binary path.
+	// Usually this case is use for testing or development, start with new mode.
+	if !inst.Version.IsEmpty() && !tidbver.TiFlashPlaygroundNewStartMode(inst.Version.String()) {
+		colorstr.Printf("[yellow][bold]Warning[reset][bold]: TiFlash is started by a compatibility method for versions earlier than v7.1. [reset]\n")
+		return inst.startOld(ctx, inst.Version)
+	}
+
+	proxyConfigPath := filepath.Join(inst.Dir, "tiflash_proxy.toml")
+	if err := prepareConfig(
+		proxyConfigPath,
+		"",
+		inst.getProxyConfig(),
+	); err != nil {
+		return err
+	}
+
+	configPath := filepath.Join(inst.Dir, "tiflash.toml")
+	if err := prepareConfig(
+		configPath,
+		inst.ConfigPath,
+		inst.getConfig(),
+	); err != nil {
+		return err
+	}
+
 	endpoints := pdEndpoints(inst.pds, false)
-
-	tidbStatusAddrs := make([]string, 0, len(inst.dbs))
-	for _, db := range inst.dbs {
-		tidbStatusAddrs = append(tidbStatusAddrs, fmt.Sprintf("%s:%d", AdvertiseHost(db.Host), uint64(db.StatusPort)))
-	}
-	wd, err := filepath.Abs(inst.Dir)
-	if err != nil {
-		return err
-	}
-
-	// Wait for PD
-	pdClient := api.NewPDClient(endpoints, 10*time.Second, nil)
-	// set low-space-ratio to 1 to avoid low disk space
-	lowSpaceRatio, err := json.Marshal(scheduleConfig{
-		LowSpaceRatio: 0.99,
-	})
-	if err != nil {
-		return err
-	}
-	if err = pdClient.UpdateScheduleConfig(bytes.NewBuffer(lowSpaceRatio)); err != nil {
-		return err
-	}
-	// Update maxReplicas before placement rules so that it would not be overwritten
-	maxReplicas, err := json.Marshal(replicateMaxReplicaConfig{
-		MaxReplicas: 1,
-	})
-	if err != nil {
-		return err
-	}
-	if err = pdClient.UpdateReplicateConfig(bytes.NewBuffer(maxReplicas)); err != nil {
-		return err
-	}
-	// Set enable-placement-rules to allow TiFlash work properly
-	enablePlacementRules, err := json.Marshal(replicateEnablePlacementRulesConfig{
-		EnablePlacementRules: "true",
-	})
-	if err != nil {
-		return err
-	}
-	if err = pdClient.UpdateReplicateConfig(bytes.NewBuffer(enablePlacementRules)); err != nil {
-		return err
-	}
-
-	// TiFlash needs to obtain absolute path of cluster_manager
-	if inst.BinPath == "" {
-		env, err := environment.InitEnv(repository.Options{
-			SkipVersionCheck:  false,
-			GOOS:              runtime.GOOS,
-			GOARCH:            runtime.GOARCH,
-			DisableDecompress: false,
-		})
-		if err != nil {
-			return err
-		}
-		if version, err = env.DownloadComponentIfMissing("tiflash", version); err != nil {
-			return err
-		}
-		// version may be empty, we will use the latest stable version later in Start cmd.
-		if inst.BinPath, err = env.BinaryPath("tiflash", version); err != nil {
-			return err
-		}
-	}
-
-	dirPath := filepath.Dir(inst.BinPath)
-	clusterManagerPath := getFlashClusterPath(dirPath)
-	if err = inst.checkConfig(wd, clusterManagerPath, version, tidbStatusAddrs, endpoints); err != nil {
-		return err
-	}
-
-	if err = os.Setenv("LD_LIBRARY_PATH", fmt.Sprintf("%s:$LD_LIBRARY_PATH", dirPath)); err != nil {
-		return err
-	}
 
 	args := []string{
 		"server",
-		fmt.Sprintf("--config-file=%s", inst.ConfigPath),
+		fmt.Sprintf("--config-file=%s", configPath),
+		"--",
+	}
+	runtimeConfig := [][]string{
+		{"path", filepath.Join(inst.Dir, "data")},
+		{"listen_host", inst.Host},
+		{"logger.log", inst.LogFile()},
+		{"logger.errorlog", filepath.Join(inst.Dir, "tiflash_error.log")},
+		{"status.metrics_port", fmt.Sprintf("%d", inst.StatusPort)},
+		{"flash.service_addr", utils.JoinHostPort(AdvertiseHost(inst.Host), inst.servicePort)},
+		{"raft.pd_addr", strings.Join(endpoints, ",")},
+		{"flash.proxy.addr", utils.JoinHostPort(inst.Host, inst.proxyPort)},
+		{"flash.proxy.advertise-addr", utils.JoinHostPort(AdvertiseHost(inst.Host), inst.proxyPort)},
+		{"flash.proxy.status-addr", utils.JoinHostPort(inst.Host, inst.proxyStatusPort)},
+		{"flash.proxy.data-dir", filepath.Join(inst.Dir, "proxy_data")},
+		{"flash.proxy.log-file", filepath.Join(inst.Dir, "tiflash_tikv.log")},
+	}
+	userConfig, err := unmarshalConfig(configPath)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for _, arg := range runtimeConfig {
+		// if user has set the config, skip it
+		if !isKeyPresentInMap(userConfig, arg[0]) {
+			args = append(args, fmt.Sprintf("--%s=%s", arg[0], arg[1]))
+		}
 	}
 
-	if inst.Process, err = NewComponentProcess(ctx, inst.Dir, inst.BinPath, "tiflash", version, args...); err != nil {
-		return err
-	}
-	logIfErr(inst.Process.SetOutputFile(inst.LogFile()))
+	return inst.PrepareProcess(ctx, inst.BinPath, args, nil, inst.Dir)
+}
 
-	return inst.Process.Start()
+func isKeyPresentInMap(m map[string]any, key string) bool {
+	keys := strings.Split(key, ".")
+	currentMap := m
+
+	for i := range keys {
+		if _, ok := currentMap[keys[i]]; !ok {
+			return false
+		}
+
+		// If the current value is a nested map, update the current map to the nested map
+		if innerMap, ok := currentMap[keys[i]].(map[string]any); ok {
+			currentMap = innerMap
+		}
+	}
+
+	return true
 }
 
 // Component return the component name.
@@ -194,59 +189,7 @@ func (inst *TiFlashInstance) LogFile() string {
 	return filepath.Join(inst.Dir, "tiflash.log")
 }
 
-// Cmd returns the internal Cmd instance
-func (inst *TiFlashInstance) Cmd() *exec.Cmd {
-	return inst.Process.Cmd()
-}
-
 // StoreAddr return the store address of TiFlash
 func (inst *TiFlashInstance) StoreAddr() string {
-	return fmt.Sprintf("%s:%d", AdvertiseHost(inst.Host), inst.ServicePort)
-}
-
-func (inst *TiFlashInstance) checkConfig(deployDir, clusterManagerPath string, version utils.Version, tidbStatusAddrs, endpoints []string) error {
-	if err := os.MkdirAll(inst.Dir, 0755); err != nil {
-		return errors.Trace(err)
-	}
-	if inst.ConfigPath == "" {
-		inst.ConfigPath = path.Join(inst.Dir, "tiflash.toml")
-	}
-	if inst.ProxyConfigPath == "" {
-		inst.ProxyConfigPath = path.Join(inst.Dir, "tiflash-learner.toml")
-	}
-
-	_, err := os.Stat(inst.ConfigPath)
-	if err == nil || os.IsExist(err) {
-		return nil
-	}
-	if !os.IsNotExist(err) {
-		return errors.Trace(err)
-	}
-	cf, err := os.Create(inst.ConfigPath)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	defer cf.Close()
-
-	_, err = os.Stat(inst.ProxyConfigPath)
-	if err == nil || os.IsExist(err) {
-		return nil
-	}
-	if !os.IsNotExist(err) {
-		return errors.Trace(err)
-	}
-	cf2, err := os.Create(inst.ProxyConfigPath)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	defer cf2.Close()
-	if err := writeTiFlashConfig(cf, inst.TCPPort, inst.Port, inst.ServicePort, inst.StatusPort,
-		inst.Host, deployDir, clusterManagerPath, tidbStatusAddrs, endpoints); err != nil {
-		return errors.Trace(err)
-	}
-	if err := writeTiFlashProxyConfig(cf2, version, inst.Host, deployDir, inst.ServicePort, inst.ProxyPort, inst.ProxyStatusPort); err != nil {
-		return errors.Trace(err)
-	}
-
-	return nil
+	return utils.JoinHostPort(AdvertiseHost(inst.Host), inst.servicePort)
 }

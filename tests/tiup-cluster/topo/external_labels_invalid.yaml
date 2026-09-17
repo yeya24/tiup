@@ -1,0 +1,24 @@
+server_configs:
+  tikv:
+    storage.reserve-space: 1K
+
+tidb_servers:
+  - host: n1
+
+pd_servers:
+  - host: n1
+
+tikv_servers:
+  - host: n1
+
+monitoring_servers:
+  - host: n1
+    rule_dir: /tmp/local/prometheus
+    external_labels:
+      cluster: overwritten
+grafana_servers:
+  - host: n1
+    dashboard_dir: /tmp/local/grafana
+alertmanager_servers:
+  - host: n1
+    config_file: /tmp/local/alertmanager/alertmanager.yml

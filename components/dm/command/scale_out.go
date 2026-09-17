@@ -16,8 +16,8 @@ package command
 import (
 	"path/filepath"
 
-	"github.com/pingcap/tiup/pkg/cluster/executor"
 	"github.com/pingcap/tiup/pkg/cluster/manager"
+	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
 	"github.com/pingcap/tiup/pkg/utils"
@@ -37,15 +37,20 @@ func newScaleOutCmd() *cobra.Command {
 				return cmd.Help()
 			}
 
-			// natvie ssh has it's own logic to find the default identity_file
-			if gOpt.SSHType == executor.SSHTypeSystem && !utils.IsFlagSetByUser(cmd.Flags(), "identity_file") {
-				opt.IdentityFile = ""
-			}
-
 			clusterName := args[0]
 			topoFile := args[1]
 
 			return cm.ScaleOut(clusterName, topoFile, postScaleOutHook, nil, opt, skipConfirm, gOpt)
+		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			switch len(args) {
+			case 0:
+				return shellCompGetClusterName(cm, toComplete)
+			case 1:
+				return nil, cobra.ShellCompDirectiveDefault
+			default:
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
 		},
 	}
 
@@ -56,6 +61,6 @@ func newScaleOutCmd() *cobra.Command {
 	return cmd
 }
 
-func postScaleOutHook(builder *task.Builder, newPart spec.Topology) {
-	postDeployHook(builder, newPart)
+func postScaleOutHook(builder *task.Builder, newPart spec.Topology, gOpt operator.Options) {
+	postDeployHook(builder, newPart, gOpt)
 }

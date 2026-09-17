@@ -15,6 +15,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -84,14 +85,16 @@ func (lr *listResult) print() {
 	if lr == nil {
 		return
 	}
-	fmt.Printf(lr.header)
+	fmt.Printf("%s", lr.header)
 	tui.PrintTable(lr.cmpTable, true)
 }
 
 func showComponentList(env *environment.Environment, opt listOptions) (*listResult, error) {
-	err := env.V1Repository().UpdateComponentManifests()
-	if err != nil {
-		return nil, err
+	if !opt.installedOnly {
+		err := env.V1Repository().UpdateComponentManifests()
+		if err != nil {
+			tui.ColorWarningMsg.Fprint(os.Stderr, "Warn: Update component manifest failed, err_msg=[", err.Error(), "]\n")
+		}
 	}
 
 	installed, err := env.Profile().InstalledComponents()
@@ -107,7 +110,7 @@ func showComponentList(env *environment.Environment, opt listOptions) (*listResu
 	}
 
 	index := v1manifest.Index{}
-	_, exists, err := env.V1Repository().Local().LoadManifest(&index)
+	_, exists, err := env.V1Repository().LocalLoadManifest(&index)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +136,7 @@ func showComponentList(env *environment.Environment, opt listOptions) (*listResu
 		}
 
 		filename := v1manifest.ComponentManifestFilename(id)
-		manifest, err := env.V1Repository().Local().LoadComponentManifest(&comp, filename)
+		manifest, err := env.V1Repository().LocalLoadComponentManifest(&comp, filename)
 		if err != nil {
 			return nil, err
 		}
@@ -181,7 +184,11 @@ func showComponentList(env *environment.Environment, opt listOptions) (*listResu
 func showComponentVersions(env *environment.Environment, component string, opt listOptions) (*listResult, error) {
 	var comp *v1manifest.Component
 	var err error
-	comp, err = env.V1Repository().FetchComponentManifest(component, false)
+	if opt.installedOnly {
+		comp, err = env.V1Repository().LocalComponentManifest(component, false)
+	} else {
+		comp, err = env.V1Repository().GetComponentManifest(component, false)
+	}
 	if err != nil {
 		return nil, errors.Annotate(err, "failed to fetch component")
 	}

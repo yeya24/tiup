@@ -28,7 +28,7 @@ import (
 	"github.com/pingcap/tiup/pkg/localdata"
 )
 
-// SSHType represent the type of the chanel used by ssh
+// SSHType represent the type of the channel used by ssh
 type SSHType string
 
 var (
@@ -47,7 +47,7 @@ var (
 
 	// This command will be execute once the NativeSSHExecutor is created.
 	// It's used to predict if the connection can establish success in the future.
-	// Its main purpose is to avoid sshpass hang when user speficied a wrong prompt.
+	// Its main purpose is to avoid sshpass hang when user specified a wrong prompt.
 	connectionTestCommand = "echo connection test, if killed, check the password prompt"
 
 	// SSH authorized_keys file
@@ -118,6 +118,19 @@ func New(etype SSHType, sudo bool, c SSHConfig) (ctxt.Executor, error) {
 	return &CheckPointExecutor{executor, &c}, nil
 }
 
+// UnwarpCheckPointExecutor unwarp the CheckPointExecutor and return the real executor
+//
+// Sometimes we just want to get the output of a command, and the CheckPointExecutor will
+// always cache the output, it will be a problem when we want to get the real output.
+func UnwarpCheckPointExecutor(e ctxt.Executor) ctxt.Executor {
+	switch e := e.(type) {
+	case *CheckPointExecutor:
+		return e.Executor
+	default:
+		return e
+	}
+}
+
 func checkLocalIP(ip string) error {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -160,7 +173,7 @@ func FindSSHAuthorizedKeysFile(ctx context.Context, exec ctxt.Executor) string {
 	sshAuthorizedKeys := defaultSSHAuthorizedKeys
 	cmd := "grep -Ev '^\\s*#|^\\s*$' /etc/ssh/sshd_config"
 	stdout, _, _ := exec.Execute(ctx, cmd, true) // error ignored as we have default value
-	for _, line := range strings.Split(string(stdout), "\n") {
+	for line := range strings.SplitSeq(string(stdout), "\n") {
 		if !strings.Contains(line, "AuthorizedKeysFile") {
 			continue
 		}

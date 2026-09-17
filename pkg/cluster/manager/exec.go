@@ -15,8 +15,6 @@ package manager
 
 import (
 	"context"
-	"fmt"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/joomcode/errorx"
@@ -26,8 +24,8 @@ import (
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // ExecOptions for exec shell commanm.
@@ -56,19 +54,19 @@ func (m *Manager) Exec(name string, opt ExecOptions, gOpt operator.Options) erro
 	var shellTasks []task.Task
 	uniqueHosts := map[string]set.StringSet{} // host-sshPort -> {command}
 	topo.IterInstance(func(inst spec.Instance) {
-		key := fmt.Sprintf("%s-%d", inst.GetHost(), inst.GetSSHPort())
+		key := utils.JoinHostPort(inst.GetManageHost(), inst.GetSSHPort())
 		if _, found := uniqueHosts[key]; !found {
 			if len(gOpt.Roles) > 0 && !filterRoles.Exist(inst.Role()) {
 				return
 			}
 
-			if len(gOpt.Nodes) > 0 && !filterNodes.Exist(inst.GetHost()) {
+			if len(gOpt.Nodes) > 0 && (!filterNodes.Exist(inst.GetHost()) && !filterNodes.Exist(inst.GetManageHost())) {
 				return
 			}
 
 			cmds, err := renderInstanceSpec(opt.Command, inst)
 			if err != nil {
-				log.Debugf("error rendering command with spec: %s", err)
+				m.logger.Debugf("error rendering command with spec: %s", err)
 				return // skip
 			}
 			cmdSet := set.NewStringSet(cmds...)
@@ -81,20 +79,29 @@ func (m *Manager) Exec(name string, opt ExecOptions, gOpt operator.Options) erro
 	})
 
 	for hostKey, i := range uniqueHosts {
-		host := strings.Split(hostKey, "-")[0]
+		host, _ := utils.ParseHostPort(hostKey)
 		for _, cmd := range i.Slice() {
 			shellTasks = append(shellTasks,
-				task.NewBuilder().
+				task.NewBuilder(m.logger).
 					Shell(host, cmd, hostKey+cmd, opt.Sudo).
 					Build())
 		}
 	}
 
-	t := m.sshTaskBuilder(name, topo, base.User, gOpt).
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
+
+	t := b.
 		Parallel(false, shellTasks...).
 		Build()
 
-	execCtx := ctxt.New(context.Background())
+	execCtx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
 	if err := t.Execute(execCtx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
@@ -105,20 +112,20 @@ func (m *Manager) Exec(name string, opt ExecOptions, gOpt operator.Options) erro
 
 	// print outputs
 	for hostKey, i := range uniqueHosts {
-		host := strings.Split(hostKey, "-")[0]
+		host, _ := utils.ParseHostPort(hostKey)
 		for _, cmd := range i.Slice() {
 			stdout, stderr, ok := ctxt.GetInner(execCtx).GetOutputs(hostKey + cmd)
 			if !ok {
 				continue
 			}
-			log.Infof("Outputs of %s on %s:",
+			m.logger.Infof("Outputs of %s on %s:",
 				color.CyanString(cmd),
 				color.CyanString(host))
 			if len(stdout) > 0 {
-				log.Infof("%s:\n%s", color.GreenString("stdout"), stdout)
+				m.logger.Infof("%s:\n%s", color.GreenString("stdout"), stdout)
 			}
 			if len(stderr) > 0 {
-				log.Infof("%s:\n%s", color.RedString("stderr"), stderr)
+				m.logger.Infof("%s:\n%s", color.RedString("stderr"), stderr)
 			}
 		}
 	}

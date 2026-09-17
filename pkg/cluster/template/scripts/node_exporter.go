@@ -15,11 +15,11 @@ package scripts
 
 import (
 	"bytes"
-	"os"
 	"path"
 	"text/template"
 
 	"github.com/pingcap/tiup/embed"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // NodeExporterScript represent the data to generate NodeExporter config
@@ -54,7 +54,7 @@ func (c *NodeExporterScript) WithNumaNode(numa string) *NodeExporterScript {
 // Config generate the config file data.
 func (c *NodeExporterScript) Config() ([]byte, error) {
 	fp := path.Join("templates", "scripts", "run_node_exporter.sh.tpl")
-	tpl, err := embed.ReadFile(fp)
+	tpl, err := embed.ReadTemplate(fp)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +67,7 @@ func (c *NodeExporterScript) ConfigToFile(file string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(file, config, 0755)
+	return utils.WriteFile(file, config, 0755)
 }
 
 // ConfigWithTemplate generate the NodeExporter config content by tpl

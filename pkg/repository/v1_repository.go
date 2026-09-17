@@ -32,10 +32,11 @@ import (
 	cjson "github.com/gibson042/canonicaljson-go"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/localdata"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/repository/v1manifest"
 	"github.com/pingcap/tiup/pkg/utils"
-	"github.com/pingcap/tiup/pkg/verbose"
 	"golang.org/x/mod/semver"
+	"golang.org/x/sync/errgroup"
 )
 
 // ErrUnknownComponent represents the specific component cannot be found in index.json
@@ -88,8 +89,8 @@ const maxTimeStampSize uint = 1024
 const maxRootSize uint = 1024 * 1024
 
 // WithOptions clone a new V1Repository with given options
-func (r *V1Repository) WithOptions(opts Options) *V1Repository {
-	return NewV1Repo(r.Mirror(), opts, r.Local())
+func (r *V1Repository) WithOptions(opts Options) Repository {
+	return NewV1Repo(r.Mirror(), opts, r.local)
 }
 
 // Mirror returns Mirror
@@ -97,9 +98,19 @@ func (r *V1Repository) Mirror() Mirror {
 	return r.mirror
 }
 
-// Local returns the local cached manifests
-func (r *V1Repository) Local() v1manifest.LocalManifests {
-	return r.local
+// LocalLoadManifest returns the local cached manifests
+func (r *V1Repository) LocalLoadManifest(index *v1manifest.Index) (*v1manifest.Manifest, bool, error) {
+	return r.local.LoadManifest(index)
+}
+
+// LocalLoadComponentManifest returns the local cached manifests for component
+func (r *V1Repository) LocalLoadComponentManifest(component *v1manifest.ComponentItem, filename string) (*v1manifest.Component, error) {
+	return r.local.LoadComponentManifest(component, filename)
+}
+
+// LocalComponentInstalled checks if the current component is already installed.
+func (r *V1Repository) LocalComponentInstalled(component, version string) (bool, error) {
+	return r.local.ComponentInstalled(component, version)
 }
 
 // UpdateComponents updates the components described by specs.
@@ -135,7 +146,7 @@ func (r *V1Repository) UpdateComponents(specs []ComponentSpec) error {
 		}
 
 		if spec.Version == "" {
-			ver, _, err := r.LatestStableVersion(spec.ID, false)
+			ver, _, err := r.LatestStableVersion(spec.ID, false, nil)
 			if err != nil {
 				errs = append(errs, err.Error())
 				continue
@@ -166,12 +177,14 @@ func (r *V1Repository) UpdateComponents(specs []ComponentSpec) error {
 		target := filepath.Join(targetDir, versionItem.URL)
 		err = r.DownloadComponent(versionItem, target)
 		if err != nil {
+			os.RemoveAll(targetDir)
 			errs = append(errs, err.Error())
 			continue
 		}
 
 		reader, err := os.Open(target)
 		if err != nil {
+			os.RemoveAll(targetDir)
 			errs = append(errs, err.Error())
 			continue
 		}
@@ -180,6 +193,7 @@ func (r *V1Repository) UpdateComponents(specs []ComponentSpec) error {
 		reader.Close()
 
 		if err != nil {
+			os.RemoveAll(targetDir)
 			errs = append(errs, err.Error())
 		}
 
@@ -199,28 +213,13 @@ func (r *V1Repository) UpdateComponents(specs []ComponentSpec) error {
 // ensureManifests ensures that the snapshot, root, and index manifests are up to date and saved in r.local.
 func (r *V1Repository) ensureManifests() error {
 	defer func(start time.Time) {
-		verbose.Log("Ensure manifests finished in %s", time.Since(start))
+		logprinter.Verbose("Ensure manifests finished in %s", time.Since(start))
 	}(time.Now())
-
-	// Update root before anything else.
-	if err := r.updateLocalRoot(); err != nil {
-		return err
-	}
 
 	// Update snapshot.
 	snapshot, err := r.updateLocalSnapshot()
 	if err != nil {
 		return err
-	}
-
-	// Check that the version of root we have is the same as declared in the snapshot.
-	newRoot, err := r.loadRoot()
-	if err != nil {
-		return err
-	}
-	snapRootVersion := snapshot.Meta[v1manifest.ManifestURLRoot].Version
-	if newRoot.Version != snapRootVersion {
-		return fmt.Errorf("root version mismatch. Expected: %v, found: %v", snapRootVersion, newRoot.Version)
 	}
 
 	return r.updateLocalIndex(snapshot)
@@ -229,11 +228,11 @@ func (r *V1Repository) ensureManifests() error {
 // Postcondition: if returned error is nil, then the local snapshot and timestamp are up to date and return the snapshot
 func (r *V1Repository) updateLocalSnapshot() (*v1manifest.Snapshot, error) {
 	defer func(start time.Time) {
-		verbose.Log("Update local snapshot finished in %s", time.Since(start))
+		logprinter.Verbose("Update local snapshot finished in %s", time.Since(start))
 	}(time.Now())
 
 	timestampChanged, tsManifest, err := r.fetchTimestamp()
-	if v1manifest.IsSignatureError(errors.Cause(err)) {
+	if v1manifest.IsSignatureError(errors.Cause(err)) || v1manifest.IsExpirationError(errors.Cause(err)) {
 		// The signature is wrong, update our signatures from the root manifest and try again.
 		err = r.updateLocalRoot()
 		if err != nil {
@@ -260,12 +259,8 @@ func (r *V1Repository) updateLocalSnapshot() (*v1manifest.Snapshot, error) {
 	}
 	hash256 := sha256.Sum256(bytes)
 
-	snapshotChanged := true
 	// TODO: check changed in fetchTimestamp by compared to the raw local snapshot instead of timestamp.
-	if snapshotExists && hash.Hashes[v1manifest.SHA256] == hex.EncodeToString(hash256[:]) {
-		// Nothing has changed in snapshot.json
-		snapshotChanged = false
-	}
+	snapshotChanged := !snapshotExists || hash.Hashes[v1manifest.SHA256] != hex.EncodeToString(hash256[:])
 
 	if snapshotChanged {
 		manifest, err := r.fetchManifestWithHash(v1manifest.ManifestURLSnapshot, &snapshot, &hash)
@@ -279,6 +274,22 @@ func (r *V1Repository) updateLocalSnapshot() (*v1manifest.Snapshot, error) {
 		err = r.local.SaveManifest(manifest, v1manifest.ManifestFilenameSnapshot)
 		if err != nil {
 			return nil, err
+		}
+
+		// Update root if needed and restart the update process
+		var oldRoot v1manifest.Root
+		_, _, err = r.local.LoadManifest(&oldRoot)
+		if err != nil {
+			return nil, err
+		}
+		newRootVersion := snapshot.Meta[v1manifest.ManifestURLRoot].Version
+
+		if newRootVersion > oldRoot.Version {
+			err := r.updateLocalRoot()
+			if err != nil {
+				return nil, err
+			}
+			return r.updateLocalSnapshot()
 		}
 	}
 
@@ -302,13 +313,8 @@ func FnameWithVersion(fname string, version uint) string {
 }
 
 func (r *V1Repository) updateLocalRoot() error {
-	// There is no need to update root.json if other manifest not changed
-	if r.timestamp != nil {
-		return nil
-	}
-
 	defer func(start time.Time) {
-		verbose.Log("Update local root finished in %s", time.Since(start))
+		logprinter.Verbose("Update local root finished in %s", time.Since(start))
 	}(time.Now())
 
 	oldRoot, err := r.loadRoot()
@@ -372,7 +378,7 @@ func (r *V1Repository) updateLocalRoot() error {
 // Precondition: the root manifest has been updated if necessary.
 func (r *V1Repository) updateLocalIndex(snapshot *v1manifest.Snapshot) error {
 	defer func(start time.Time) {
-		verbose.Log("Update local index finished in %s", time.Since(start))
+		logprinter.Verbose("Update local index finished in %s", time.Since(start))
 	}(time.Now())
 
 	// Update index (if needed).
@@ -414,7 +420,7 @@ func (r *V1Repository) updateLocalIndex(snapshot *v1manifest.Snapshot) error {
 // Precondition: the snapshot and index manifests exist and are up to date.
 func (r *V1Repository) updateComponentManifest(id string, withYanked bool) (*v1manifest.Component, error) {
 	defer func(start time.Time) {
-		verbose.Log("update component '%s' manifest finished in %s", id, time.Since(start))
+		logprinter.Verbose("update component '%s' manifest finished in %s", id, time.Since(start))
 	}(time.Now())
 
 	// Find the component's entry in the index and snapshot manifests.
@@ -450,13 +456,22 @@ func (r *V1Repository) updateComponentManifest(id string, withYanked bool) (*v1m
 
 	if oldVersion != 0 && oldVersion == fileVersion.Version {
 		// We're up to date, load the old manifest from disk.
-		return r.local.LoadComponentManifest(&item, filename)
+		comp, err := r.local.LoadComponentManifest(&item, filename)
+		if comp == nil && err == nil {
+			err = fmt.Errorf("component %s does not exist", id)
+		}
+		return comp, err
 	}
 
 	var component v1manifest.Component
-	manifest, err := r.fetchComponentManifest(&item, url, &component, fileVersion.Length)
-	if err != nil {
-		return nil, err
+	manifest, fetchErr := r.fetchComponentManifest(&item, url, &component, fileVersion.Length)
+	if fetchErr != nil {
+		// ignore manifest expiration error here and continue building component object,
+		// the manifest expiration error should be handled by caller, so try to return it
+		// with a valid component object.
+		if !v1manifest.IsExpirationError(errors.Cause(fetchErr)) {
+			return nil, fetchErr
+		}
 	}
 
 	if oldVersion != 0 && component.Version < oldVersion {
@@ -468,15 +483,26 @@ func (r *V1Repository) updateComponentManifest(id string, withYanked bool) (*v1m
 		return nil, err
 	}
 
-	return &component, nil
+	return &component, fetchErr
 }
 
 // DownloadComponent downloads the component specified by item into local file,
 // the component will be removed if hash is not correct
 func (r *V1Repository) DownloadComponent(item *v1manifest.VersionItem, target string) error {
+	// make a tempdir such that every download will not inference each other
 	targetDir := filepath.Dir(target)
-	err := r.mirror.Download(item.URL, targetDir)
+	err := os.MkdirAll(targetDir, 0755)
 	if err != nil {
+		return errors.Trace(err)
+	}
+
+	targetDir, err = os.MkdirTemp(targetDir, "download")
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer os.Remove(targetDir)
+
+	if err := r.mirror.Download(item.URL, targetDir); err != nil {
 		return err
 	}
 
@@ -518,7 +544,7 @@ func (r *V1Repository) fetchTimestamp() (changed bool, manifest *v1manifest.Mani
 	}
 
 	defer func(start time.Time) {
-		verbose.Log("Fetch timestamp finished in %s", time.Since(start))
+		logprinter.Verbose("Fetch timestamp finished in %s", time.Since(start))
 		r.timestamp = manifest
 	}(time.Now())
 
@@ -530,8 +556,8 @@ func (r *V1Repository) fetchTimestamp() (changed bool, manifest *v1manifest.Mani
 
 	hash := ts.SnapshotHash()
 
-	var localTs v1manifest.Timestamp
-	_, exists, err := r.local.LoadManifest(&localTs)
+	var localTS v1manifest.Timestamp
+	_, exists, err := r.local.LoadManifest(&localTS)
 	if err != nil {
 		return false, nil, err
 	}
@@ -539,9 +565,9 @@ func (r *V1Repository) fetchTimestamp() (changed bool, manifest *v1manifest.Mani
 	switch {
 	case !exists:
 		changed = true
-	case ts.Version < localTs.Version:
-		return false, nil, fmt.Errorf("timestamp manifest has a version number < the old manifest (%v, %v)", ts.Version, localTs.Version)
-	case hash.Hashes[v1manifest.SHA256] != localTs.SnapshotHash().Hashes[v1manifest.SHA256]:
+	case ts.Version < localTS.Version:
+		return false, nil, fmt.Errorf("timestamp manifest has a version number < the old manifest (%v, %v)", ts.Version, localTS.Version)
+	case hash.Hashes[v1manifest.SHA256] != localTS.SnapshotHash().Hashes[v1manifest.SHA256]:
 		changed = true
 	}
 
@@ -597,7 +623,7 @@ func (r *V1Repository) fetchBase(url string, maxSize uint, f func(reader io.Read
 
 	m, err := f(reader)
 	if err != nil {
-		return nil, errors.Annotatef(err, "read manifest from mirror(%s) failed", r.mirror.Source())
+		return m, errors.Annotatef(err, "read manifest from mirror(%s) failed", r.mirror.Source())
 	}
 	return m, nil
 }
@@ -682,7 +708,7 @@ func (r *V1Repository) DownloadTiUP(targetDir string) error {
 		TargetDir: targetDir,
 		ID:        TiUPBinaryName,
 		Version:   "",
-		Force:     false,
+		Force:     true,
 	}
 	return r.UpdateComponents([]ComponentSpec{spec})
 }
@@ -694,18 +720,22 @@ func (r *V1Repository) UpdateComponentManifests() error {
 		return err
 	}
 
+	var g errgroup.Group
 	for name := range index.Components {
-		_, err = r.updateComponentManifest(name, false)
-		if err != nil && errors.Cause(err) != ErrUnknownComponent {
+		g.Go(func() error {
+			_, err := r.updateComponentManifest(name, false)
+			if err != nil && errors.Cause(err) == ErrUnknownComponent {
+				err = nil
+			}
 			return err
-		}
+		})
 	}
-
-	return nil
+	err = g.Wait()
+	return err
 }
 
-// FetchComponentManifest fetch the component manifest.
-func (r *V1Repository) FetchComponentManifest(id string, withYanked bool) (com *v1manifest.Component, err error) {
+// GetComponentManifest fetch the component manifest.
+func (r *V1Repository) GetComponentManifest(id string, withYanked bool) (com *v1manifest.Component, err error) {
 	err = r.ensureManifests()
 	if err != nil {
 		return nil, err
@@ -714,9 +744,25 @@ func (r *V1Repository) FetchComponentManifest(id string, withYanked bool) (com *
 	return r.updateComponentManifest(id, withYanked)
 }
 
+// LocalComponentManifest load the component manifest from local.
+func (r *V1Repository) LocalComponentManifest(id string, withYanked bool) (com *v1manifest.Component, err error) {
+	index := v1manifest.Index{}
+	_, exists, err := r.local.LoadManifest(&index)
+	if err == nil && exists {
+		components := index.ComponentList()
+		comp := components[id]
+		filename := v1manifest.ComponentManifestFilename(id)
+		componentManifest, err := r.local.LoadComponentManifest(&comp, filename)
+		if err == nil && componentManifest != nil {
+			return componentManifest, nil
+		}
+	}
+	return r.GetComponentManifest(id, withYanked)
+}
+
 // ComponentVersion returns version item of a component
 func (r *V1Repository) ComponentVersion(id, ver string, includeYanked bool) (*v1manifest.VersionItem, error) {
-	manifest, err := r.FetchComponentManifest(id, includeYanked)
+	manifest, err := r.GetComponentManifest(id, includeYanked)
 	if err != nil {
 		return nil, err
 	}
@@ -728,7 +774,7 @@ func (r *V1Repository) ComponentVersion(id, ver string, includeYanked bool) (*v1
 		ver = manifest.Nightly
 	}
 	if ver == "" {
-		v, _, err := r.LatestStableVersion(id, includeYanked)
+		v, _, err := r.LatestStableVersion(id, includeYanked, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -741,61 +787,105 @@ func (r *V1Repository) ComponentVersion(id, ver string, includeYanked bool) (*v1
 	return vi, nil
 }
 
-// ResolveComponentVersion resolves the latest version of a component that satisfies the constraint
-func (r *V1Repository) ResolveComponentVersion(id, constraint string) (utils.Version, error) {
-	manifest, err := r.FetchComponentManifest(id, false)
+// LocalComponentVersion returns version item of a component from local manifest file
+func (r *V1Repository) LocalComponentVersion(id, ver string, includeYanked bool) (*v1manifest.VersionItem, error) {
+	manifest, err := r.LocalComponentManifest(id, includeYanked)
+	if err != nil {
+		return nil, err
+	}
+
+	if ver == utils.NightlyVersionAlias {
+		if !manifest.HasNightly(r.PlatformString()) {
+			return nil, errors.Annotatef(ErrUnknownVersion, "component %s does not have nightly on %s", id, r.PlatformString())
+		}
+
+		ver = manifest.Nightly
+	}
+	if ver == "" {
+		v, _, err := r.LatestStableVersion(id, includeYanked, nil)
+		if err != nil {
+			return nil, err
+		}
+		ver = v.String()
+	}
+	vi := manifest.VersionItem(r.PlatformString(), ver, includeYanked)
+	if vi == nil {
+		return nil, errors.Annotatef(ErrUnknownVersion, "version %s on %s for component %s not found", ver, r.PlatformString(), id)
+	}
+	return vi, nil
+}
+
+func findVersionFromManifest(id, constraint, platform string, manifest *v1manifest.Component) (string, error) {
+	cons, err := utils.NewConstraint(constraint)
+	if err != nil {
+		return "", err
+	}
+	versions := manifest.VersionList(platform)
+	verList := make([]string, 0, len(versions))
+	for v := range versions {
+		verList = append(verList, v)
+	}
+	sort.Slice(verList, func(p, q int) bool {
+		return semver.Compare(verList[p], verList[q]) > 0
+	})
+	for _, v := range verList {
+		if cons.Check(v) {
+			return v, nil
+		}
+	}
+	return "", errors.Annotatef(ErrUnknownVersion, "version %s on %s for component %s not found", constraint, platform, id)
+}
+
+// ResolveComponentVersionWithPlatform resolves the latest version of a component that satisfies the constraint
+func (r *V1Repository) ResolveComponentVersionWithPlatform(id, constraint, platform string) (utils.Version, error) {
+	manifest, err := r.LocalComponentManifest(id, false)
 	if err != nil {
 		return "", err
 	}
 	var ver string
-	switch constraint {
-	case "", utils.LatestVersionAlias:
-		v, _, err := r.LatestStableVersion(id, false)
+	switch {
+	case constraint == "" || strings.HasPrefix(constraint, utils.LatestVersionAlias):
+		var f func(string) bool
+		if strings.Contains(constraint, utils.NextgenVersionAlias) {
+			f = func(s string) bool {
+				return !strings.Contains(s, "nextgen") && !strings.Contains(s, "next-gen")
+			}
+		}
+		v, _, err := r.LatestStableVersion(id, false, f)
 		if err != nil {
 			return "", err
 		}
 		ver = v.String()
-	case utils.NightlyVersionAlias:
-		if !manifest.HasNightly(r.PlatformString()) {
-			return "", errors.Annotatef(ErrUnknownVersion, "component %s does not have nightly on %s", id, r.PlatformString())
-		}
-		ver = manifest.Nightly
-	default:
-		cons, err := utils.NewConstraint(constraint)
+	case strings.HasPrefix(constraint, utils.NightlyVersionAlias):
+		v, _, err := r.LatestNightlyVersion(id)
 		if err != nil {
 			return "", err
 		}
-		versions := manifest.VersionList(r.PlatformString())
-		verList := make([]string, 0, len(versions))
-		for v := range versions {
-			if v == manifest.Nightly {
-				continue
+		ver = v.String()
+	default:
+		ver, err = findVersionFromManifest(id, constraint, platform, manifest)
+		if err != nil {
+			manifest, err = r.GetComponentManifest(id, false)
+			if err != nil {
+				return "", err
 			}
-			verList = append(verList, v)
-		}
-		sort.Slice(verList, func(p, q int) bool {
-			return semver.Compare(verList[p], verList[q]) > 0
-		})
-		for _, v := range verList {
-			if cons.Check(v) {
-				ver = v
-				break
+			ver, err = findVersionFromManifest(id, constraint, platform, manifest)
+			if err != nil {
+				return "", errors.Annotatef(ErrUnknownVersion, "version %s on %s for component %s not found", constraint, platform, id)
 			}
 		}
-	}
-	if ver == "" {
-		return "", fmt.Errorf(`no version on %s for component %s satisfies constraint "%s"`, r.PlatformString(), id, constraint)
-	}
-	vi := manifest.VersionItem(r.PlatformString(), ver, false)
-	if vi == nil {
-		return "", errors.Annotatef(ErrUnknownVersion, "version %s on %s for component %s not found", ver, r.PlatformString(), id)
 	}
 	return utils.Version(ver), nil
 }
 
+// ResolveComponentVersion resolves the latest version of a component that satisfies the constraint
+func (r *V1Repository) ResolveComponentVersion(id, constraint string) (utils.Version, error) {
+	return r.ResolveComponentVersionWithPlatform(id, constraint, r.PlatformString())
+}
+
 // LatestNightlyVersion returns the latest nightly version of specific component
 func (r *V1Repository) LatestNightlyVersion(id string) (utils.Version, *v1manifest.VersionItem, error) {
-	com, err := r.FetchComponentManifest(id, false)
+	com, err := r.GetComponentManifest(id, false)
 	if err != nil {
 		return "", nil, err
 	}
@@ -808,8 +898,8 @@ func (r *V1Repository) LatestNightlyVersion(id string) (utils.Version, *v1manife
 }
 
 // LatestStableVersion returns the latest stable version of specific component
-func (r *V1Repository) LatestStableVersion(id string, withYanked bool) (utils.Version, *v1manifest.VersionItem, error) {
-	com, err := r.FetchComponentManifest(id, withYanked)
+func (r *V1Repository) LatestStableVersion(id string, withYanked bool, filter func(string) bool) (utils.Version, *v1manifest.VersionItem, error) {
+	com, err := r.GetComponentManifest(id, withYanked)
 	if err != nil {
 		return "", nil, err
 	}
@@ -828,6 +918,9 @@ func (r *V1Repository) LatestStableVersion(id string, withYanked bool) (utils.Ve
 	var lastStable string
 	for v := range versions {
 		if utils.Version(v).IsNightly() {
+			continue
+		}
+		if filter != nil && filter(v) {
 			continue
 		}
 
@@ -853,23 +946,8 @@ func (r *V1Repository) LatestStableVersion(id string, withYanked bool) (utils.Ve
 // Support you have install the component, need to get entry from local manifest.
 // Load the manifest locally only to get then Entry, do not force do something need access mirror.
 func (r *V1Repository) BinaryPath(installPath string, componentID string, ver string) (string, error) {
-	component, err := r.updateComponentManifest(componentID, false)
-	if err != nil {
-		return "", err
-	}
-
-	// Always use the newest nightly entry.
-	// Because the one the user installed may be scraped.
-	if utils.Version(ver).IsNightly() {
-		if !component.HasNightly(r.PlatformString()) {
-			return "", errors.Errorf("the component `%s` on platform %s does not have a nightly version", componentID, r.PlatformString())
-		}
-
-		ver = component.Nightly
-	}
-
 	// We need yanked version because we may have installed that version before it was yanked
-	versionItem, err := r.ComponentVersion(componentID, ver, true)
+	versionItem, err := r.LocalComponentVersion(componentID, ver, true)
 	if err != nil {
 		return "", err
 	}

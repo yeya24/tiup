@@ -14,7 +14,6 @@
 package utils
 
 import (
-	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -23,27 +22,29 @@ import (
 // To avoid the same port be generated twice in a short time
 var portCache sync.Map
 
-// GetFreePort asks the kernel for a free open port that is ready to use.
-func GetFreePort(host string, priority int) (int, error) {
-	if port, err := getPort(host, priority); err == nil {
+func getFreePort(host string, defaultPort int) (int, error) {
+	//revive:disable
+	if port, err := getPort(host, defaultPort); err == nil {
 		return port, nil
 	} else if port, err := getPort(host, 0); err == nil {
 		return port, nil
 	} else {
 		return 0, err
 	}
+	//revive:enable
 }
 
 // MustGetFreePort asks the kernel for a free open port that is ready to use, if fail, panic
-func MustGetFreePort(host string, priority int) int {
-	if port, err := GetFreePort(host, priority); err == nil {
+func MustGetFreePort(host string, defaultPort int, portOffset int) int {
+	bestPort := defaultPort + portOffset
+	if port, err := getFreePort(host, bestPort); err == nil {
 		return port
 	}
 	panic("can't get a free port")
 }
 
 func getPort(host string, port int) (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", host, port))
+	addr, err := net.ResolveTCPAddr("tcp", JoinHostPort(host, port))
 	if err != nil {
 		return 0, err
 	}
@@ -56,7 +57,7 @@ func getPort(host string, port int) (int, error) {
 	port = l.Addr().(*net.TCPAddr).Port
 	l.Close()
 
-	key := fmt.Sprintf("%s:%d", host, port)
+	key := JoinHostPort(host, port)
 	if t, ok := portCache.Load(key); ok && t.(time.Time).Add(time.Minute).After(time.Now()) {
 		return getPort(host, (port+1)%65536)
 	}

@@ -23,33 +23,67 @@ import (
 	"github.com/pingcap/tiup/pkg/utils"
 )
 
+// TiDBRole is the role of TiDB.
+type TiDBRole = string
+
+const (
+	// TiDBRoleDefault is the default role of TiDB
+	TiDBRoleDefault TiDBRole = "tidb"
+	// TiDBRoleSystem is the nextgen role of TiDB
+	TiDBRoleSystem TiDBRole = "tidb_system"
+)
+
 // TiDBInstance represent a running tidb-server
 type TiDBInstance struct {
 	instance
-	pds []*PDInstance
-	Process
-	enableBinlog bool
+	shOpt          SharedOptions
+	pds            []*PDInstance
+	kvwrks         []*TiKVWorkerInstance
+	tiproxyCertDir string
+	enableBinlog   bool
 }
 
+var _ Instance = &TiDBInstance{}
+
 // NewTiDBInstance return a TiDBInstance
-func NewTiDBInstance(binPath string, dir, host, configPath string, id int, pds []*PDInstance, enableBinlog bool) *TiDBInstance {
+func NewTiDBInstance(shOpt SharedOptions, binPath string, dir, host, configPath string, id, port int, pds []*PDInstance, kvwrks []*TiKVWorkerInstance, tiproxyCertDir string, enableBinlog bool, role string) *TiDBInstance {
+	if port <= 0 {
+		if role == TiDBRoleSystem {
+			port = 3000
+		} else {
+			port = 4000
+		}
+	}
 	return &TiDBInstance{
+		shOpt: shOpt,
 		instance: instance{
 			BinPath:    binPath,
 			ID:         id,
 			Dir:        dir,
 			Host:       host,
-			Port:       utils.MustGetFreePort(host, 4000),
-			StatusPort: utils.MustGetFreePort("0.0.0.0", 10080),
+			Port:       utils.MustGetFreePort(host, port, shOpt.PortOffset),
+			StatusPort: utils.MustGetFreePort("0.0.0.0", 10080, shOpt.PortOffset),
 			ConfigPath: configPath,
+			role:       role,
 		},
-		pds:          pds,
-		enableBinlog: enableBinlog,
+		tiproxyCertDir: tiproxyCertDir,
+		pds:            pds,
+		kvwrks:         kvwrks,
+		enableBinlog:   enableBinlog,
 	}
 }
 
 // Start calls set inst.cmd and Start
-func (inst *TiDBInstance) Start(ctx context.Context, version utils.Version) error {
+func (inst *TiDBInstance) Start(ctx context.Context) error {
+	configPath := filepath.Join(inst.Dir, "tidb.toml")
+	if err := prepareConfig(
+		configPath,
+		inst.ConfigPath,
+		inst.getConfig(inst.kvwrks),
+	); err != nil {
+		return err
+	}
+
 	endpoints := pdEndpoints(inst.pds, false)
 
 	args := []string{
@@ -59,24 +93,16 @@ func (inst *TiDBInstance) Start(ctx context.Context, version utils.Version) erro
 		fmt.Sprintf("--status=%d", inst.StatusPort),
 		fmt.Sprintf("--path=%s", strings.Join(endpoints, ",")),
 		fmt.Sprintf("--log-file=%s", filepath.Join(inst.Dir, "tidb.log")),
-	}
-	if inst.ConfigPath != "" {
-		args = append(args, fmt.Sprintf("--config=%s", inst.ConfigPath))
+		fmt.Sprintf("--config=%s", configPath),
 	}
 	if inst.enableBinlog {
 		args = append(args, "--enable-binlog=true")
 	}
 
-	var err error
-	if inst.Process, err = NewComponentProcess(ctx, inst.Dir, inst.BinPath, "tidb", version, args...); err != nil {
-		return err
-	}
-	logIfErr(inst.Process.SetOutputFile(inst.LogFile()))
-
-	return inst.Process.Start()
+	return inst.PrepareProcess(ctx, inst.BinPath, args, nil, inst.Dir)
 }
 
-// Component return the component name.
+// Component returns the package name.
 func (inst *TiDBInstance) Component() string {
 	return "tidb"
 }
@@ -88,5 +114,5 @@ func (inst *TiDBInstance) LogFile() string {
 
 // Addr return the listen address of TiDB
 func (inst *TiDBInstance) Addr() string {
-	return fmt.Sprintf("%s:%d", AdvertiseHost(inst.Host), inst.Port)
+	return utils.JoinHostPort(AdvertiseHost(inst.Host), inst.Port)
 }

@@ -17,17 +17,64 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 
+	"github.com/BurntSushi/toml"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tiup/pkg/cluster/spec"
+	"github.com/pingcap/tiup/pkg/environment"
+	tiupexec "github.com/pingcap/tiup/pkg/exec"
+	"github.com/pingcap/tiup/pkg/tui/colorstr"
 	"github.com/pingcap/tiup/pkg/utils"
+)
+
+// Mode of playground
+type Mode = string
+
+var (
+	// ModeNormal is the default mode.
+	ModeNormal = "tidb"
+	// ModeCSE is for CSE testing.
+	ModeCSE = "tidb-cse"
+	// ModeNextGen is for NG testing.
+	ModeNextGen = "tidb-x"
+	// ModeDisAgg is for tiflash testing.
+	ModeDisAgg = "tiflash-disagg"
+	// ModeTiKVSlim is for special tikv testing.
+	ModeTiKVSlim = "tikv-slim"
 )
 
 // Config of the instance.
 type Config struct {
-	ConfigPath string
-	BinPath    string
-	Num        int
-	Host       string
-	UpTimeout  int
+	ConfigPath string `yaml:"config_path"`
+	BinPath    string `yaml:"bin_path"`
+	Num        int    `yaml:"num"`
+	Host       string `yaml:"host"`
+	Port       int    `yaml:"port"`
+	UpTimeout  int    `yaml:"up_timeout"`
+	Version    string `yaml:"version"`
+}
+
+// SharedOptions contains some commonly used, tunable options for most components.
+// Unlike Config, these options are shared for all instances of all components.
+type SharedOptions struct {
+	/// Whether or not to tune the cluster in order to run faster (instead of easier to debug).
+	HighPerf           bool       `yaml:"high_perf"`
+	CSE                CSEOptions `yaml:"cse"` // Only available when mode == ModeCSE or ModeDisAgg
+	PDMode             string     `yaml:"pd_mode"`
+	Mode               string     `yaml:"mode"`
+	PortOffset         int        `yaml:"port_offset"`
+	EnableTiKVColumnar bool       `yaml:"enable_tikv_columnar"` // Only available when mode == ModeCSE
+	ForcePull          bool       `yaml:"force_pull"`
+}
+
+// CSEOptions contains configs to run TiDB cluster in CSE mode.
+type CSEOptions struct {
+	S3Endpoint string `yaml:"s3_endpoint"`
+	Bucket     string `yaml:"bucket"`
+	AccessKey  string `yaml:"access_key"`
+	SecretKey  string `yaml:"secret_key"`
 }
 
 type instance struct {
@@ -38,32 +85,98 @@ type instance struct {
 	StatusPort int // client port for PD
 	ConfigPath string
 	BinPath    string
+	Version    utils.Version
+	proc       Process
+	role       string
+}
+
+// MetricAddr will be used by prometheus scrape_configs.
+type MetricAddr struct {
+	Targets []string          `json:"targets"`
+	Labels  map[string]string `json:"labels"`
 }
 
 // Instance represent running component
 type Instance interface {
-	Pid() int
 	// Start the instance process.
 	// Will kill the process once the context is done.
-	Start(ctx context.Context, version utils.Version) error
-	// Component Return the component name.
+	Start(ctx context.Context) error
+	// Name Return the display name.
+	Name() string
+	// Component returns the package name.
 	Component() string
+	// Role returns the role of the package.
+	// It is used to start binaries differently for the same package.
+	// For example, start PD in microservice mode, or start TiDB with another configuration.
+	Role() string
 	// LogFile return the log file name
 	LogFile() string
-	// Uptime show uptime.
-	Uptime() string
-	// StatusAddrs return the address to pull metrics.
-	StatusAddrs() []string
+	// MetricAddr return the address to pull metrics.
+	MetricAddr() MetricAddr
 	// Wait Should only call this if the instance is started successfully.
 	// The implementation should be safe to call Wait multi times.
 	Wait() error
+	// Proc return the underlying process.
+	Process() Process
+	// PrepareBinary use given binpath or download from tiup mirrors.
+	PrepareBinary(binaryName string, componentName string, version string, force bool) error
+	// PrepareProcess construct the process used later.
+	PrepareProcess(ctx context.Context, binPath string, args, envs []string, workDir string) error
 }
 
-func (inst *instance) StatusAddrs() (addrs []string) {
+func (inst *instance) Name() string {
+	return fmt.Sprintf("%s-%d", inst.Role(), inst.ID)
+}
+
+func (inst *instance) Component() string {
+	return inst.role
+}
+
+func (inst *instance) Role() string {
+	return inst.role
+}
+
+func (inst *instance) Wait() error {
+	return inst.proc.Wait()
+}
+
+func (inst *instance) PrepareProcess(ctx context.Context, binPath string, args, envs []string, workDir string) error {
+	inst.proc = &process{cmd: PrepareCommand(ctx, binPath, args, envs, workDir)}
+	return nil
+}
+
+func (inst *instance) Process() Process {
+	return inst.proc
+}
+
+func (inst *instance) MetricAddr() (r MetricAddr) {
 	if inst.Host != "" && inst.StatusPort != 0 {
-		addrs = append(addrs, fmt.Sprintf("%s:%d", inst.Host, inst.StatusPort))
+		r.Targets = append(r.Targets, utils.JoinHostPort(inst.Host, inst.StatusPort))
 	}
 	return
+}
+
+func (inst *instance) PrepareBinary(binaryName string, componentName string, boundVersion string, force bool) error {
+	var version utils.Version
+	var err error
+	if inst.BinPath == "" {
+		if version, err = environment.GlobalEnv().V1Repository().ResolveComponentVersion(binaryName, boundVersion); err != nil {
+			return err
+		}
+	}
+	instanceBinPath, err := tiupexec.PrepareBinary(binaryName, version, inst.BinPath, force)
+	if err != nil {
+		return err
+	}
+	// distinguish whether the instance is started by specific binary path.
+	if inst.BinPath == "" {
+		colorstr.Printf("[dark_gray]Start %s instance: %s[reset]\n", componentName, version)
+	} else {
+		colorstr.Printf("[dark_gray]Start %s instance: %s[reset]\n", componentName, instanceBinPath)
+	}
+	inst.Version = utils.Version(boundVersion)
+	inst.BinPath = instanceBinPath
+	return nil
 }
 
 // CompVersion return the format to run specified version of a component.
@@ -93,20 +206,60 @@ func AdvertiseHost(listen string) string {
 	return listen
 }
 
-func logIfErr(err error) {
-	if err != nil {
-		fmt.Println(err)
-	}
-}
-
 func pdEndpoints(pds []*PDInstance, isHTTP bool) []string {
 	var endpoints []string
 	for _, pd := range pds {
+		if pd.Role() == PDRoleTSO || pd.Role() == PDRoleScheduling ||
+			pd.Role() == PDRoleRouter || pd.Role() == PDRoleResourceManager {
+			continue
+		}
 		if isHTTP {
-			endpoints = append(endpoints, fmt.Sprintf("http://%s:%d", AdvertiseHost(pd.Host), pd.StatusPort))
+			endpoints = append(endpoints, "http://"+utils.JoinHostPort(AdvertiseHost(pd.Host), pd.StatusPort))
 		} else {
-			endpoints = append(endpoints, fmt.Sprintf("%s:%d", AdvertiseHost(pd.Host), pd.StatusPort))
+			endpoints = append(endpoints, utils.JoinHostPort(AdvertiseHost(pd.Host), pd.StatusPort))
 		}
 	}
 	return endpoints
+}
+
+// prepareConfig accepts a user specified config and merge user config with a
+// pre-defined one.
+func prepareConfig(outputConfigPath string, userConfigPath string, preDefinedConfig map[string]any) error {
+	dir := filepath.Dir(outputConfigPath)
+	if err := utils.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	userConfig, err := unmarshalConfig(userConfigPath)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if userConfig == nil {
+		userConfig = make(map[string]any)
+	}
+
+	cf, err := os.Create(outputConfigPath)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	enc := toml.NewEncoder(cf)
+	enc.Indent = ""
+	return enc.Encode(spec.MergeConfig(preDefinedConfig, userConfig))
+}
+
+func unmarshalConfig(path string) (map[string]any, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	c := make(map[string]any)
+	err = toml.Unmarshal(data, &c)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }

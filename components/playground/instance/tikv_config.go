@@ -13,22 +13,40 @@
 
 package instance
 
-import (
-	"io"
-)
+import "path/filepath"
 
-const tikvConfig = `
-[rocksdb]
-max-open-files = 256
+func (inst *TiKVInstance) getConfig() map[string]any {
+	config := make(map[string]any)
+	config["rocksdb.max-open-files"] = 256
+	config["raftdb.max-open-files"] = 256
+	config["storage.reserve-space"] = 0
+	config["storage.reserve-raft-space"] = 0
 
-[raftdb]
-max-open-files = 256
+	switch inst.shOpt.Mode {
+	case ModeCSE:
+		config["storage.api-version"] = 2
+		config["storage.enable-ttl"] = true
+		config["dfs.prefix"] = "tikv"
+		config["dfs.s3-endpoint"] = inst.shOpt.CSE.S3Endpoint
+		config["dfs.s3-key-id"] = inst.shOpt.CSE.AccessKey
+		config["dfs.s3-secret-key"] = inst.shOpt.CSE.SecretKey
+		config["dfs.s3-bucket"] = inst.shOpt.CSE.Bucket
+		config["dfs.s3-region"] = "local"
+		config["kvengine.build-columnar"] = true
+	case ModeNextGen:
+		config["storage.api-version"] = 2
+		config["storage.enable-ttl"] = true
+		config["dfs.prefix"] = "tikv"
+		config["dfs.s3-endpoint"] = inst.shOpt.CSE.S3Endpoint
+		config["dfs.s3-key-id"] = inst.shOpt.CSE.AccessKey
+		config["dfs.s3-secret-key"] = inst.shOpt.CSE.SecretKey
+		config["dfs.s3-bucket"] = inst.shOpt.CSE.Bucket
+		config["dfs.s3-region"] = "local"
+		config["rfengine.wal-sync-dir"] = filepath.Join(inst.Dir, "raft-wal")
+		config["rfengine.lightweight-backup"] = true
+		config["rfengine.target-file-size"] = "512MB"
+		config["rfengine.wal-chunk-target-file-size"] = "128MB"
+	}
 
-[storage]
-reserve-space = 0
-`
-
-func writeTiKVConfig(w io.Writer) error {
-	_, err := w.Write([]byte(tikvConfig))
-	return err
+	return config
 }

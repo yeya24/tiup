@@ -17,19 +17,20 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/fatih/color"
 	"github.com/joomcode/errorx"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cliutil"
 	"github.com/pingcap/tiup/pkg/cluster/clusterutil"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/tui"
 )
 
 // ScaleIn the cluster.
@@ -37,39 +38,28 @@ func (m *Manager) ScaleIn(
 	name string,
 	skipConfirm bool,
 	gOpt operator.Options,
-	scale func(builer *task.Builder, metadata spec.Metadata, tlsCfg *tls.Config),
+	scale func(builder *task.Builder, metadata spec.Metadata, tlsCfg *tls.Config),
 ) error {
 	if err := clusterutil.ValidateClusterNameOrError(name); err != nil {
 		return err
 	}
 
-	var (
-		force bool     = gOpt.Force
-		nodes []string = gOpt.Nodes
-	)
-	if !skipConfirm {
-		if err := cliutil.PromptForConfirmOrAbortError(
-			"This operation will delete the %s nodes in `%s` and all their data.\nDo you want to continue? [y/N]:",
-			strings.Join(nodes, ","),
-			color.HiYellowString(name)); err != nil {
-			return err
-		}
-
-		if force {
-			if err := cliutil.PromptForConfirmOrAbortError(
-				"Forcing scale in is unsafe and may result in data lost for stateful components.\nDo you want to continue? [y/N]:",
-			); err != nil {
-				return err
-			}
-		}
-
-		log.Infof("Scale-in nodes...")
+	// check locked
+	if err := m.specManager.ScaleOutLockedErr(name); err != nil {
+		return err
 	}
 
+	var (
+		force = gOpt.Force
+		nodes = gOpt.Nodes
+	)
+
 	metadata, err := m.meta(name)
-	if err != nil && !errors.Is(perrs.Cause(err), meta.ErrValidate) &&
+	if err != nil &&
+		!errors.Is(perrs.Cause(err), meta.ErrValidate) &&
 		!errors.Is(perrs.Cause(err), spec.ErrMultipleTiSparkMaster) &&
-		!errors.Is(perrs.Cause(err), spec.ErrMultipleTisparkWorker) {
+		!errors.Is(perrs.Cause(err), spec.ErrMultipleTisparkWorker) &&
+		!errors.Is(perrs.Cause(err), spec.ErrNoTiSparkMaster) {
 		// ignore conflict check error, node may be deployed by former version
 		// that lack of some certain conflict checks
 		return err
@@ -78,31 +68,58 @@ func (m *Manager) ScaleIn(
 	topo := metadata.GetTopology()
 	base := metadata.GetBaseMeta()
 
-	// Regenerate configuration
-	regenConfigTasks, hasImported := buildRegenConfigTasks(m, name, topo, base, nodes, true)
+	if !skipConfirm {
+		if force {
+			m.logger.Warnf("%s", color.HiRedString(tui.ASCIIArtWarning))
+			if err := tui.PromptForAnswerOrAbortError(
+				"Yes, I know my data might be lost.",
+				"%s", color.HiRedString("Forcing scale in is unsafe and may result in data loss for stateful components.\n"+
+					"DO NOT use `--force` if you have any component in ")+
+					color.YellowString("Pending Offline")+color.HiRedString(" status.\n")+
+					color.HiRedString("The process is irreversible and could NOT be cancelled.\n")+
+					"Only use `--force` when some of the servers are already permanently offline.\n"+
+					"Are you sure to continue?",
+			); err != nil {
+				return err
+			}
+		}
 
-	// handle dir scheme changes
-	if hasImported {
-		if err := spec.HandleImportPathMigration(name); err != nil {
+		if err := tui.PromptForConfirmOrAbortError(
+			"This operation will delete the %s nodes in `%s` and all their data.\nDo you want to continue? [y/N]:",
+			strings.Join(nodes, ","),
+			color.HiYellowString(name)); err != nil {
 			return err
 		}
+
+		if err := checkAsyncComps(topo, nodes); err != nil {
+			return err
+		}
+
+		m.logger.Infof("Scale-in nodes...")
 	}
+
+	// Regenerate configuration
+	gOpt.IgnoreConfigCheck = true
 
 	tlsCfg, err := topo.TLSConfig(m.specManager.Path(name, spec.TLSCertKeyDir))
 	if err != nil {
 		return err
 	}
 
-	b := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	scaledInPD := isScaledInPD(topo, nodes)
 
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
 	scale(b, metadata, tlsCfg)
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
 
-	t := b.
-		ParallelStep("+ Refresh instance configs", force, regenConfigTasks...).
-		Parallel(force, buildReloadPromTasks(metadata.GetTopology(), nodes...)...).
-		Build()
-
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	if err := b.Build().Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -110,7 +127,93 @@ func (m *Manager) ScaleIn(
 		return perrs.Trace(err)
 	}
 
-	log.Infof("Scaled cluster `%s` in successfully", name)
+	// get new metadata
+	metadata, err = m.meta(name)
+	if err != nil &&
+		!errors.Is(perrs.Cause(err), meta.ErrValidate) &&
+		!errors.Is(perrs.Cause(err), spec.ErrMultipleTiSparkMaster) &&
+		!errors.Is(perrs.Cause(err), spec.ErrMultipleTisparkWorker) &&
+		!errors.Is(perrs.Cause(err), spec.ErrNoTiSparkMaster) {
+		// ignore conflict check error, node may be deployed by former version
+		// that lack of some certain conflict checks
+		return err
+	}
+
+	topo = metadata.GetTopology()
+	base = metadata.GetBaseMeta()
+
+	regenConfigTasks := buildInitConfigTasks(m, name, topo, base, gOpt, nodes)
+
+	b, err = m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
+	t := b.
+		ParallelStep("+ Refresh instance configs", force, regenConfigTasks...).
+		ParallelStep("+ Reload prometheus and grafana", gOpt.Force,
+			buildReloadPromAndGrafanaTasks(metadata.GetTopology(), m.logger, gOpt, nodes...)...).
+		Build()
+
+	if err := t.Execute(ctx); err != nil {
+		if errorx.Cast(err) != nil {
+			// FIXME: Map possible task errors and give suggestions.
+			return err
+		}
+		return perrs.Trace(err)
+	}
+
+	m.logger.Infof("Scaled cluster `%s` in successfully", name)
+	if warning := dashboardScaleInWarning(name, scaledInPD, topo); warning != "" {
+		m.logger.Warnf("%s", warning)
+	}
 
 	return nil
+}
+
+// checkAsyncComps
+func checkAsyncComps(topo spec.Topology, nodes []string) error {
+	var asyncOfflineComps = set.NewStringSet(spec.ComponentPump, spec.ComponentTiKV, spec.ComponentTiFlash, spec.ComponentDrainer)
+	deletedNodes := set.NewStringSet(nodes...)
+	delAsyncOfflineComps := set.NewStringSet()
+	topo.IterInstance(func(instance spec.Instance) {
+		if deletedNodes.Exist(instance.ID()) {
+			if asyncOfflineComps.Exist(instance.ComponentName()) {
+				delAsyncOfflineComps.Insert(instance.ComponentName())
+			}
+		}
+	})
+
+	if len(delAsyncOfflineComps.Slice()) > 0 {
+		return tui.PromptForConfirmOrAbortError("%s", fmt.Sprintf(
+			"%s\nDo you want to continue? [y/N]:", color.YellowString(
+				"The component `%s` will become tombstone, maybe exists in several minutes or hours, after that you can use the prune command to clean it",
+				delAsyncOfflineComps.Slice())))
+	}
+	return nil
+}
+
+// isScaledInPD reports whether any of the given node IDs belongs to a PD instance.
+func isScaledInPD(topo spec.Topology, nodes []string) bool {
+	deletedNodes := set.NewStringSet(nodes...)
+	scaledInPD := false
+	topo.IterInstance(func(inst spec.Instance) {
+		if deletedNodes.Exist(inst.ID()) && inst.ComponentName() == spec.ComponentPD {
+			scaledInPD = true
+		}
+	})
+	return scaledInPD
+}
+
+// dashboardScaleInWarning returns restart guidance when PD was scaled in and a
+// standalone Dashboard remains in the updated topology.
+func dashboardScaleInWarning(name string, scaledInPD bool, topo spec.Topology) string {
+	dash := spec.FindComponent(topo, spec.ComponentDashboard)
+	if !scaledInPD || dash == nil || len(dash.Instances()) == 0 {
+		return ""
+	}
+	return color.YellowString(
+		"\nSince PD node(s) were scaled in, the standalone tidb-dashboard connects to a single PD endpoint "+
+			"that may have been removed. If it can no longer reach PD, restart it to pick up a new endpoint:\n\t%s",
+		color.GreenString("%s restart %s -R %s", tui.OsArgs0(), name, spec.ComponentDashboard),
+	)
 }

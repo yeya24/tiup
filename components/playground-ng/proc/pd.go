@@ -1,0 +1,270 @@
+// Copyright 2020 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package proc
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tiup/pkg/tidbver"
+	"github.com/pingcap/tiup/pkg/utils"
+)
+
+const (
+	// ServicePD is the service ID for PD.
+	ServicePD ServiceID = "pd"
+	// ServicePDAPI is the service ID for the PD API-only service.
+	ServicePDAPI ServiceID = "pd-api"
+	// ServicePDTSO is the service ID for the PD TSO-only service.
+	ServicePDTSO ServiceID = "pd-tso"
+	// ServicePDScheduling is the service ID for the PD Scheduling-only service.
+	ServicePDScheduling ServiceID = "pd-scheduling"
+	// ServicePDRouter is the service ID for the PD Router-only service.
+	ServicePDRouter ServiceID = "pd-router"
+	// ServicePDResourceManager is the service ID for the PD Resource Manager-only service.
+	ServicePDResourceManager ServiceID = "pd-resource-manager"
+
+	// ComponentPD is the repository component ID for PD.
+	ComponentPD RepoComponentID = "pd"
+)
+
+func init() {
+	RegisterComponentDisplayName(ComponentPD, "PD")
+	RegisterServiceDisplayName(ServicePD, "PD")
+	RegisterServiceDisplayName(ServicePDAPI, "PD API")
+	RegisterServiceDisplayName(ServicePDTSO, "PD TSO")
+	RegisterServiceDisplayName(ServicePDScheduling, "PD Scheduling")
+	RegisterServiceDisplayName(ServicePDRouter, "PD Router")
+	RegisterServiceDisplayName(ServicePDResourceManager, "PD Resource Manager")
+
+	factory := func(plan ServicePlan, info ProcessInfo, shOpt SharedOptions, _ string) (Process, error) {
+		if plan.PD == nil {
+			name := info.Name()
+			if name == "" {
+				name = ServicePD.String()
+			}
+			return nil, errors.Errorf("missing pd plan for %s", name)
+		}
+		return &PDInstance{ShOpt: shOpt, Plan: *plan.PD, ProcessInfo: info}, nil
+	}
+	for _, serviceID := range []ServiceID{
+		ServicePD,
+		ServicePDAPI,
+		ServicePDTSO,
+		ServicePDScheduling,
+		ServicePDRouter,
+		ServicePDResourceManager,
+	} {
+		registerPlannedProcessFactory(serviceID, factory)
+	}
+}
+
+// PDPlan is the service-specific plan for PD-related services.
+//
+// Fields are intentionally "static": executor should be able to start instances
+// without re-deriving endpoints from other instances.
+type PDPlan struct {
+	// InitialCluster is used by pd/pd-api (choose one of InitialCluster/JoinAddrs).
+	InitialCluster []PDMemberPlan
+	// JoinAddrs is used by pd/pd-api when joining an existing cluster.
+	JoinAddrs []string // host:peerPort
+
+	// BackendAddrs is used by pd-* microservices as backend endpoints.
+	BackendAddrs []string // host:statusPort
+
+	KVIsSingleReplica bool
+}
+
+// PDMemberPlan is one member in the pd/pd-api initial cluster.
+type PDMemberPlan struct {
+	Name     string
+	PeerAddr string // host:peerPort
+}
+
+// PDInstance represent a running pd-server
+type PDInstance struct {
+	ProcessInfo
+	ShOpt SharedOptions
+	Plan  PDPlan
+}
+
+var _ Process = &PDInstance{}
+
+// Join set endpoints field of PDInstance
+func (inst *PDInstance) Join(pds []*PDInstance) *PDInstance {
+	inst.Plan.InitialCluster = nil
+	inst.Plan.JoinAddrs = nil
+	for _, pd := range pds {
+		if pd == nil {
+			continue
+		}
+		host := AdvertiseHost(pd.Host)
+		inst.Plan.JoinAddrs = append(inst.Plan.JoinAddrs, utils.JoinHostPort(host, pd.Port))
+	}
+	return inst
+}
+
+// InitCluster set the init cluster instance.
+func (inst *PDInstance) InitCluster(pds []*PDInstance) *PDInstance {
+	inst.Plan.JoinAddrs = nil
+	inst.Plan.InitialCluster = nil
+	for _, pd := range pds {
+		if pd == nil {
+			continue
+		}
+		info := pd.Info()
+		if info == nil {
+			continue
+		}
+		host := AdvertiseHost(pd.Host)
+		inst.Plan.InitialCluster = append(inst.Plan.InitialCluster, PDMemberPlan{
+			Name:     info.Name(),
+			PeerAddr: utils.JoinHostPort(host, pd.Port),
+		})
+	}
+	return inst
+}
+
+func (inst *PDInstance) prepareNormalArgs(configPath, uid string) ([]string, error) {
+	if inst == nil {
+		return nil, errors.New("pd instance is nil")
+	}
+
+	args := make([]string, 0, 16)
+	if inst.Service == ServicePDAPI {
+		args = append(args, "services", "api")
+	}
+	args = append(args,
+		"--name="+uid,
+		fmt.Sprintf("--config=%s", configPath),
+		fmt.Sprintf("--data-dir=%s", filepath.Join(inst.Dir, "data")),
+		fmt.Sprintf("--peer-urls=http://%s", utils.JoinHostPort(inst.Host, inst.Port)),
+		fmt.Sprintf("--advertise-peer-urls=http://%s", utils.JoinHostPort(AdvertiseHost(inst.Host), inst.Port)),
+		fmt.Sprintf("--client-urls=http://%s", utils.JoinHostPort(inst.Host, inst.StatusPort)),
+		fmt.Sprintf("--advertise-client-urls=http://%s", utils.JoinHostPort(AdvertiseHost(inst.Host), inst.StatusPort)),
+		fmt.Sprintf("--log-file=%s", inst.LogFile()),
+	)
+
+	switch {
+	case len(inst.Plan.InitialCluster) > 0:
+		endpoints := make([]string, 0, len(inst.Plan.InitialCluster))
+		for _, m := range inst.Plan.InitialCluster {
+			if m.Name == "" || m.PeerAddr == "" {
+				continue
+			}
+			endpoints = append(endpoints, fmt.Sprintf("%s=http://%s", m.Name, m.PeerAddr))
+		}
+		args = append(args, fmt.Sprintf("--initial-cluster=%s", strings.Join(endpoints, ",")))
+	case len(inst.Plan.JoinAddrs) > 0:
+		endpoints := make([]string, 0, len(inst.Plan.JoinAddrs))
+		for _, addr := range inst.Plan.JoinAddrs {
+			if addr == "" {
+				continue
+			}
+			endpoints = append(endpoints, fmt.Sprintf("http://%s", addr))
+		}
+		args = append(args, fmt.Sprintf("--join=%s", strings.Join(endpoints, ",")))
+	default:
+		return nil, errors.Errorf("must set the init or join instances")
+	}
+
+	return args, nil
+}
+
+func (inst *PDInstance) prepareMicroserviceArgs(configPath, uid string) ([]string, error) {
+	if inst == nil {
+		return nil, errors.New("pd instance is nil")
+	}
+
+	endpoints := make([]string, 0, len(inst.Plan.BackendAddrs))
+	for _, addr := range inst.Plan.BackendAddrs {
+		if addr == "" {
+			continue
+		}
+		endpoints = append(endpoints, "http://"+addr)
+	}
+
+	subservice := strings.TrimPrefix(inst.Service.String(), "pd-")
+	args := []string{
+		"services",
+		subservice,
+		fmt.Sprintf("--listen-addr=http://%s", utils.JoinHostPort(inst.Host, inst.StatusPort)),
+		fmt.Sprintf("--advertise-listen-addr=http://%s", utils.JoinHostPort(AdvertiseHost(inst.Host), inst.StatusPort)),
+		fmt.Sprintf("--backend-endpoints=%s", strings.Join(endpoints, ",")),
+		fmt.Sprintf("--log-file=%s", inst.LogFile()),
+		fmt.Sprintf("--config=%s", configPath),
+	}
+	if tidbver.PDSupportMicroservicesWithName(inst.Version.String()) {
+		args = append(args, fmt.Sprintf("--name=%s", uid))
+	}
+	return args, nil
+}
+
+// Prepare builds the PD process command.
+func (inst *PDInstance) Prepare(ctx context.Context) error {
+	info := inst.Info()
+	if inst.Service == "" {
+		return errors.New("pd service is empty")
+	}
+
+	configPath := filepath.Join(inst.Dir, inst.Service.String()+".toml")
+	if err := prepareConfig(
+		configPath,
+		inst.ConfigPath,
+		inst.getConfig(),
+		nil,
+	); err != nil {
+		return err
+	}
+
+	uid := info.Name()
+	var (
+		args []string
+		err  error
+	)
+	switch inst.Service {
+	case ServicePD, ServicePDAPI:
+		args, err = inst.prepareNormalArgs(configPath, uid)
+	case ServicePDTSO, ServicePDScheduling, ServicePDRouter, ServicePDResourceManager:
+		args, err = inst.prepareMicroserviceArgs(configPath, uid)
+	default:
+		return errors.Errorf("unknown pd service %s", inst.Service)
+	}
+	if err != nil {
+		return err
+	}
+
+	info.Proc = &cmdProcess{cmd: PrepareCommand(ctx, inst.BinPath, args, nil, inst.Dir)}
+	return nil
+}
+
+// LogFile return the log file.
+func (inst *PDInstance) LogFile() string {
+	if inst == nil || inst.Dir == "" {
+		return ""
+	}
+	name := inst.Service.String()
+	if name == "" {
+		name = "pd"
+	}
+	return filepath.Join(inst.Dir, name+".log")
+}
+
+// Addr return the listen address of PD
+func (inst *PDInstance) Addr() string {
+	return utils.JoinHostPort(AdvertiseHost(inst.Host), inst.StatusPort)
+}

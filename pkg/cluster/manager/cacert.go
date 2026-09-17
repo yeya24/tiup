@@ -22,7 +22,7 @@ import (
 	perrs "github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/crypto"
-	"github.com/pingcap/tiup/pkg/file"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 func genAndSaveClusterCA(name, tlsPath string) (*crypto.CertificateAuthority, error) {
@@ -32,12 +32,12 @@ func genAndSaveClusterCA(name, tlsPath string) (*crypto.CertificateAuthority, er
 	}
 
 	// save CA private key
-	if err := file.SaveFileWithBackup(filepath.Join(tlsPath, spec.TLSCAKey), ca.Key.Pem(), ""); err != nil {
+	if err := utils.SaveFileWithBackup(filepath.Join(tlsPath, spec.TLSCAKey), ca.Key.Pem(), ""); err != nil {
 		return nil, perrs.Annotatef(err, "cannot save CA private key for %s", name)
 	}
 
 	// save CA certificate
-	if err := file.SaveFileWithBackup(
+	if err := utils.SaveFileWithBackup(
 		filepath.Join(tlsPath, spec.TLSCACert),
 		pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE",
@@ -56,7 +56,7 @@ func genAndSaveClientCert(ca *crypto.CertificateAuthority, name, tlsPath string)
 	}
 
 	// save client private key
-	if err := file.SaveFileWithBackup(filepath.Join(tlsPath, spec.TLSClientKey), privKey.Pem(), ""); err != nil {
+	if err := utils.SaveFileWithBackup(filepath.Join(tlsPath, spec.TLSClientKey), privKey.Pem(), ""); err != nil {
 		return perrs.Annotatef(err, "cannot save client private key for %s", name)
 	}
 
@@ -74,7 +74,7 @@ func genAndSaveClientCert(ca *crypto.CertificateAuthority, name, tlsPath string)
 	}
 
 	// save client certificate
-	if err := file.SaveFileWithBackup(
+	if err := utils.SaveFileWithBackup(
 		filepath.Join(tlsPath, spec.TLSClientCert),
 		pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE",
@@ -92,7 +92,7 @@ func genAndSaveClientCert(ca *crypto.CertificateAuthority, name, tlsPath string)
 	if err != nil {
 		return perrs.Annotatef(err, "cannot encode client certificate to PKCS#12 format for %s", name)
 	}
-	if err := file.SaveFileWithBackup(
+	if err := utils.SaveFileWithBackup(
 		filepath.Join(tlsPath, spec.PFXClientCert),
 		pfxData,
 		""); err != nil {
@@ -100,4 +100,61 @@ func genAndSaveClientCert(ca *crypto.CertificateAuthority, name, tlsPath string)
 	}
 
 	return nil
+}
+
+// genAndSaveCertificate  generate CA and client cert for TLS enabled cluster
+func (m *Manager) genAndSaveCertificate(clusterName string, globalOptions *spec.GlobalOptions) (*crypto.CertificateAuthority, error) {
+	var ca *crypto.CertificateAuthority
+	if globalOptions.TLSEnabled {
+		// generate CA
+		tlsPath := m.specManager.Path(clusterName, spec.TLSCertKeyDir)
+		if err := utils.MkdirAll(tlsPath, 0755); err != nil {
+			return nil, err
+		}
+		ca, err := genAndSaveClusterCA(clusterName, tlsPath)
+		if err != nil {
+			return nil, err
+		}
+
+		// generate client cert
+		if err = genAndSaveClientCert(ca, clusterName, tlsPath); err != nil {
+			return nil, err
+		}
+	}
+
+	return ca, nil
+}
+
+// checkCertificate  check if the certificate file exists
+// no need to determine whether to enable tls
+func (m *Manager) checkCertificate(clusterName string) error {
+	tlsFiles := []string{
+		m.specManager.Path(clusterName, spec.TLSCertKeyDir, spec.TLSCACert),
+		m.specManager.Path(clusterName, spec.TLSCertKeyDir, spec.TLSClientKey),
+		m.specManager.Path(clusterName, spec.TLSCertKeyDir, spec.TLSClientCert),
+	}
+
+	// check if the file exists
+	for _, file := range tlsFiles {
+		if !utils.IsExist(file) {
+			return perrs.Errorf("TLS file: %s does not exist", file)
+		}
+	}
+	return nil
+}
+
+// loadCertificate
+// certificate file exists and reload is true
+// will reload certificate file
+func (m *Manager) loadCertificate(clusterName string, globalOptions *spec.GlobalOptions, reload bool) error {
+	err := m.checkCertificate(clusterName)
+
+	// no need to reload and the file already exists
+	if !reload && err == nil {
+		return nil
+	}
+
+	_, err = m.genAndSaveCertificate(clusterName, globalOptions)
+
+	return err
 }

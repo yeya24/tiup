@@ -15,6 +15,8 @@ package repository
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -28,17 +30,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cavaliercoder/grab"
+	"github.com/cavaliergopher/grab/v3"
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/logger/log"
+	"github.com/pingcap/tiup/pkg/crypto/rand"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/repository/model"
 	"github.com/pingcap/tiup/pkg/repository/store"
 	"github.com/pingcap/tiup/pkg/repository/v1manifest"
 	"github.com/pingcap/tiup/pkg/utils"
 	"github.com/pingcap/tiup/pkg/utils/mock"
-	"github.com/pingcap/tiup/pkg/utils/rand"
-	"github.com/pingcap/tiup/pkg/verbose"
+	"github.com/pingcap/tiup/pkg/version"
 )
 
 const (
@@ -64,8 +66,30 @@ type (
 		Finish()
 	}
 
+	// DownloadProgressReporter is an optional extension interface for
+	// DownloadProgress implementations that want to receive retry/success/failure
+	// signals for a given download URL.
+	//
+	// When provided, the repository will prefer reporting retryable failures via
+	// these callbacks instead of emitting standalone log lines, making it
+	// possible to integrate cleanly with progress UIs.
+	DownloadProgressReporter interface {
+		// Retry is called when a retryable error occurred and the downloader will
+		// retry the same URL. attempt is 1-based (the first retry is attempt=1).
+		Retry(url string, attempt, maxAttempts int, err error)
+		// Success is called when the download succeeded (after any retries).
+		Success(url string)
+		// Error is called when the download failed and will not be retried further.
+		Error(url string, attempt, maxAttempts int, err error)
+	}
+
 	// MirrorOptions is used to customize the mirror download options
 	MirrorOptions struct {
+		// Context controls download cancelation. When canceled, ongoing network
+		// operations should return as soon as possible.
+		//
+		// If nil, implementations should treat it as context.Background().
+		Context  context.Context
 		Progress DownloadProgress
 		Upstream string
 		KeyDir   string
@@ -102,13 +126,14 @@ func NewMirror(mirror string, options MirrorOptions) Mirror {
 			options: options,
 		}
 	}
-	return &localFilesystem{rootPath: mirror, keyDir: options.KeyDir, upstream: options.Upstream}
+	return &localFilesystem{rootPath: mirror, keyDir: options.KeyDir, upstream: options.Upstream, ctx: options.Context}
 }
 
 type localFilesystem struct {
 	rootPath string
 	keyDir   string
 	upstream string
+	ctx      context.Context
 	keys     map[string]*v1manifest.KeyInfo
 }
 
@@ -220,7 +245,7 @@ func (l *localFilesystem) Download(resource, targetDir string) error {
 	}
 	defer reader.Close()
 
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
+	if err := utils.MkdirAll(targetDir, 0755); err != nil {
 		return errors.Trace(err)
 	}
 	outPath := filepath.Join(targetDir, resource)
@@ -233,12 +258,28 @@ func (l *localFilesystem) Download(resource, targetDir string) error {
 	}
 	defer writer.Close()
 
-	_, err = io.Copy(writer, reader)
+	src := io.Reader(reader)
+	if l.ctx != nil {
+		src = &contextReader{ctx: l.ctx, r: reader}
+	}
+	_, err = io.Copy(writer, src)
+	if err != nil {
+		_ = writer.Close()
+		_ = os.Remove(outPath)
+	}
 	return err
 }
 
 // Fetch implements the Mirror interface
 func (l *localFilesystem) Fetch(resource string, maxSize int64) (io.ReadCloser, error) {
+	if l.ctx != nil {
+		select {
+		case <-l.ctx.Done():
+			return nil, errors.Trace(l.ctx.Err())
+		default:
+		}
+	}
+
 	path := filepath.Join(l.rootPath, resource)
 	file, err := os.OpenFile(path, os.O_RDONLY, os.ModePerm)
 	if err != nil {
@@ -287,12 +328,35 @@ func (l *httpMirror) Open() error {
 	return nil
 }
 
-func (l *httpMirror) download(url string, to string, maxSize int64) (io.ReadCloser, error) {
+func (l *httpMirror) downloadFile(url string, to string, maxSize int64) (io.ReadCloser, error) {
 	defer func(start time.Time) {
-		verbose.Log("Download resource %s in %s", url, time.Since(start))
+		logprinter.Verbose("Download resource %s in %s", url, time.Since(start))
 	}(time.Now())
 
+	baseCtx := l.options.Context
+	if baseCtx != nil {
+		select {
+		case <-baseCtx.Done():
+			return nil, errors.Trace(baseCtx.Err())
+		default:
+		}
+	} else {
+		baseCtx = context.Background()
+	}
+
+	ctx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
+
 	client := grab.NewClient()
+
+	// workaround to resolve cdn error "tls: protocol version not supported"
+	client.HTTPClient.(*http.Client).Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		// avoid using http/2 by setting non-nil TLSClientConfig
+		TLSClientConfig: &tls.Config{},
+	}
+
+	client.UserAgent = fmt.Sprintf("tiup/%s", version.NewTiUPVersion().SemVer())
 	req, err := grab.NewRequest(to, url)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -300,11 +364,14 @@ func (l *httpMirror) download(url string, to string, maxSize int64) (io.ReadClos
 	if len(to) == 0 {
 		req.NoStore = true
 	}
+	req = req.WithContext(ctx)
 
 	resp := client.Do(req)
 
 	// start progress output loop
-	t := time.NewTicker(time.Millisecond)
+	// 10 FPS is enough for progress reporting and avoids excessive CPU usage
+	// under fast networks (grab download callbacks can be very frequent).
+	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
 
 	var progress DownloadProgress
@@ -315,16 +382,29 @@ func (l *httpMirror) download(url string, to string, maxSize int64) (io.ReadClos
 	}
 	progress.Start(url, resp.Size())
 
+	ctxDone := ctx.Done()
+
 L:
 	for {
 		select {
 		case <-t.C:
 			if maxSize > 0 && resp.BytesComplete() > maxSize {
-				_ = resp.Cancel()
+				cancel()
+				progress.SetCurrent(resp.BytesComplete())
+				progress.Finish()
 				return nil, errors.Errorf("download from %s failed, resp size %d exceeds maximum size %d", url, resp.BytesComplete(), maxSize)
 			}
 			progress.SetCurrent(resp.BytesComplete())
+		case <-ctxDone:
+			progress.SetCurrent(resp.BytesComplete())
+			progress.Finish()
+			select {
+			case <-resp.Done:
+			case <-time.After(200 * time.Millisecond):
+			}
+			return nil, errors.Trace(baseCtx.Err())
 		case <-resp.Done:
+			progress.SetCurrent(resp.BytesComplete())
 			progress.Finish()
 			break L
 		}
@@ -392,7 +472,7 @@ func (l *httpMirror) Rotate(m *v1manifest.Manifest) error {
 			return err
 		}
 
-		return fmt.Errorf("Unknow error from server, response code: %d response body: %s", resp.StatusCode, buf.String())
+		return fmt.Errorf("unknow error from server, response code: %d response body: %s", resp.StatusCode, buf.String())
 	}
 }
 
@@ -409,7 +489,7 @@ func (l *httpMirror) Publish(manifest *v1manifest.Manifest, info model.Component
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 300 {
-			return errors.Errorf("error on uplaod tarbal, server returns %d", resp.StatusCode)
+			return errors.Errorf("error on upload tarball, server returns %d", resp.StatusCode)
 		}
 	}
 
@@ -434,7 +514,7 @@ func (l *httpMirror) Publish(manifest *v1manifest.Manifest, info model.Component
 	}
 	manifestAddr := fmt.Sprintf("%s/api/v1/component/%s/%s%s", l.Source(), sid, manifest.Signed.(*v1manifest.Component).ID, qstr)
 
-	client := http.Client{Timeout: time.Minute}
+	client := http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Post(manifestAddr, "text/json", bodyBuf)
 	if err != nil {
 		return err
@@ -455,7 +535,7 @@ func (l *httpMirror) Publish(manifest *v1manifest.Manifest, info model.Component
 			return err
 		}
 
-		return fmt.Errorf("Unknow error from server, response code: %d response body: %s", resp.StatusCode, buf.String())
+		return fmt.Errorf("unknow error from server, response code: %d response body: %s", resp.StatusCode, buf.String())
 	}
 }
 
@@ -481,37 +561,76 @@ func (l *httpMirror) Download(resource, targetDir string) error {
 	// downloaded file is stored in a temp directory and the temp directory is
 	// deleted at Close(), in this way an interrupted download won't remain
 	// any partial file on the disk
-	var err error
-	_ = utils.Retry(func() error {
-		var r io.ReadCloser
-		if err != nil && l.isRetryable(err) {
-			log.Warnf("failed to download %s(%s), retrying...", resource, err.Error())
-		}
-		if r, err = l.download(l.prepareURL(resource), tmpFilePath, 0); err != nil {
-			if l.isRetryable(err) {
+	reporter, _ := l.options.Progress.(DownloadProgressReporter)
+
+	const (
+		maxAttempts = 5
+		retryDelay  = 500 * time.Millisecond
+	)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		url := l.prepareURL(resource)
+
+		r, err := l.downloadFile(url, tmpFilePath, 0)
+		if err == nil {
+			if err := r.Close(); err != nil {
+				if l.isRetryable(err) && attempt < maxAttempts {
+					if reporter != nil {
+						reporter.Retry(url, attempt, maxAttempts, err)
+					} else {
+						logprinter.Warnf("failed to download %s(%s), retrying...", resource, err.Error())
+					}
+					time.Sleep(retryDelay)
+					continue
+				}
+				if reporter != nil {
+					reporter.Error(url, attempt, maxAttempts, err)
+				}
 				return err
 			}
-			// Abort retry
+
+			if err := utils.MkdirAll(targetDir, 0755); err != nil {
+				if reporter != nil {
+					reporter.Error(url, attempt, maxAttempts, err)
+				}
+				return errors.Trace(err)
+			}
+			if err := utils.Move(tmpFilePath, dstFilePath); err != nil {
+				if reporter != nil {
+					reporter.Error(url, attempt, maxAttempts, err)
+				}
+				return errors.Trace(err)
+			}
+
+			if reporter != nil {
+				reporter.Success(url)
+			}
 			return nil
 		}
-		return r.Close()
-	}, utils.RetryOption{
-		Timeout:  time.Hour,
-		Attempts: 3,
-	})
-	if err != nil {
+
+		if l.isRetryable(err) && attempt < maxAttempts {
+			if reporter != nil {
+				reporter.Retry(url, attempt, maxAttempts, err)
+			} else {
+				logprinter.Warnf("failed to download %s(%s), retrying...", resource, err.Error())
+			}
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		if reporter != nil {
+			reporter.Error(url, attempt, maxAttempts, err)
+		}
 		return err
 	}
 
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return errors.Trace(err)
-	}
-	return utils.Move(tmpFilePath, dstFilePath)
+	// Should never reach here.
+	return errors.Errorf("download %s failed: reached unexpected retry loop end", resource)
 }
 
 // Fetch implements the Mirror interface
 func (l *httpMirror) Fetch(resource string, maxSize int64) (io.ReadCloser, error) {
-	return l.download(l.prepareURL(resource), "", maxSize)
+	return l.downloadFile(l.prepareURL(resource), "", maxSize)
 }
 
 // Close implements the Mirror interface
@@ -545,7 +664,7 @@ func (l *MockMirror) Download(resource, targetDir string) error {
 		return errors.Annotatef(ErrNotFound, "resource %s", resource)
 	}
 
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
+	if err := utils.MkdirAll(targetDir, 0755); err != nil {
 		return err
 	}
 	target := filepath.Join(targetDir, resource)
@@ -593,4 +712,23 @@ func (l *MockMirror) Fetch(resource string, maxSize int64) (io.ReadCloser, error
 // Close implements Mirror.
 func (l *MockMirror) Close() error {
 	return nil
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if r == nil || r.r == nil {
+		return 0, io.EOF
+	}
+	if r.ctx != nil {
+		select {
+		case <-r.ctx.Done():
+			return 0, r.ctx.Err()
+		default:
+		}
+	}
+	return r.r.Read(p)
 }

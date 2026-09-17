@@ -15,12 +15,12 @@ package system
 
 import (
 	"bytes"
-	"os"
 	"path"
 	"strings"
 	"text/template"
 
 	"github.com/pingcap/tiup/embed"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // TiSparkConfig represent the data to generate systemd config
@@ -30,7 +30,7 @@ type TiSparkConfig struct {
 	DeployDir   string
 	JavaHome    string
 	// Takes one of no, on-success, on-failure, on-abnormal, on-watchdog, on-abort, or always.
-	// The Template set as always if this is not setted.
+	// The Template set as always if this is not set.
 	Restart string
 }
 
@@ -55,13 +55,13 @@ func (c *TiSparkConfig) ConfigToFile(file string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(file, config, 0755)
+	return utils.WriteFile(file, config, 0755)
 }
 
 // Config generate the config file data.
 func (c *TiSparkConfig) Config() ([]byte, error) {
 	fp := path.Join("templates", "systemd", "tispark.service.tpl")
-	tpl, err := embed.ReadFile(fp)
+	tpl, err := embed.ReadTemplate(fp)
 	if err != nil {
 		return nil, err
 	}

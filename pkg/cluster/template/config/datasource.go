@@ -15,58 +15,47 @@ package config
 
 import (
 	"bytes"
-	"os"
 	"path"
 	"text/template"
 
 	"github.com/pingcap/tiup/embed"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // DatasourceConfig represent the data to generate Datasource config
 type DatasourceConfig struct {
-	ClusterName string
-	IP          string
-	Port        uint64
+	Name      string
+	Type      string
+	URL       string
+	IsDefault bool
 }
 
 // NewDatasourceConfig returns a DatasourceConfig
-func NewDatasourceConfig(cluster, ip string) *DatasourceConfig {
+func NewDatasourceConfig(clusterName, url string) *DatasourceConfig {
 	return &DatasourceConfig{
-		ClusterName: cluster,
-		IP:          ip,
-		Port:        9090,
+		Name:      clusterName,
+		Type:      "prometheus",
+		URL:       url,
+		IsDefault: true,
 	}
 }
 
-// WithPort set Port field of DatasourceConfig
-func (c *DatasourceConfig) WithPort(port uint64) *DatasourceConfig {
-	c.Port = port
+// WithName sets name of datasource
+func (c *DatasourceConfig) WithName(name string) *DatasourceConfig {
+	c.Name = name
 	return c
 }
 
-// Config generate the config file data.
-func (c *DatasourceConfig) Config() ([]byte, error) {
-	fp := path.Join("templates", "config", "datasource.yml.tpl")
-	tpl, err := embed.ReadFile(fp)
-	if err != nil {
-		return nil, err
-	}
-	return c.ConfigWithTemplate(string(tpl))
+// WithType sets type of datasource
+func (c *DatasourceConfig) WithType(typ string) *DatasourceConfig {
+	c.Type = typ
+	return c
 }
 
-// ConfigWithTemplate generate the Datasource config content by tpl
-func (c *DatasourceConfig) ConfigWithTemplate(tpl string) ([]byte, error) {
-	tmpl, err := template.New("Datasource").Parse(tpl)
-	if err != nil {
-		return nil, err
-	}
-
-	content := bytes.NewBufferString("")
-	if err := tmpl.Execute(content, c); err != nil {
-		return nil, err
-	}
-
-	return content.Bytes(), nil
+// WithIsDefault sets if datasource is default
+func (c *DatasourceConfig) WithIsDefault(isDefault bool) *DatasourceConfig {
+	c.IsDefault = isDefault
+	return c
 }
 
 // ConfigToFile write config content to specific path
@@ -75,5 +64,28 @@ func (c *DatasourceConfig) ConfigToFile(file string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(file, config, 0755)
+	return utils.WriteFile(file, config, 0755)
+}
+
+// Config generate the config file data.
+func (c *DatasourceConfig) Config() ([]byte, error) {
+	fp := path.Join("templates", "config", "datasource.yml.tpl")
+	tpl, err := embed.ReadTemplate(fp)
+	if err != nil {
+		return nil, err
+	}
+
+	tmpl, err := template.New("Datasource").Parse(string(tpl))
+	if err != nil {
+		return nil, err
+	}
+
+	content := bytes.NewBufferString("")
+	if err := tmpl.Execute(content, map[string]any{
+		"Datasources": []any{c},
+	}); err != nil {
+		return nil, err
+	}
+
+	return content.Bytes(), nil
 }

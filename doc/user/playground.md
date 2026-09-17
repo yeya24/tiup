@@ -10,6 +10,10 @@ playground's basic usage:
 tiup playground [version] [flags]
 ```
 
+> Note:
+>
+> If you need daemon mode (start in background) or want to use the next generation local playground, see [Playground-NG](./playground-ng.md) (`tiup playground-ng`).
+
 The simplest startup command `tiup playground` will start a cluster of 1 KV, 1 DB, 1 PD using locally installed TiDB/TiKV/PD or their stable version. This order actually does the following.
 - Since no version is specified, TiUP looks for the latest version of the installed playground first, assuming the latest version is v0.0.6, which is equivalent to tiup playground:v0.0.6.
 - If the playground component has never had any version installed, TiUP will install the latest stable version before starting the runtime instance.
@@ -22,23 +26,49 @@ The command line arguments for playground state:
 ```bash
 Usage:
   tiup playground [version] [flags]
+  tiup [command]
+
+Available Commands:
+  completion  generate the autocompletion script for the specified shell
+  display
+  help        Help about any command
+  scale-in
+  scale-out
 
 Flags:
-      --db int                   TiDB instance number (default 1)
+      --db int                   TiDB instance number
+      --db.host host             Playground TiDB host. If not provided, TiDB will still use host flag as its host
+      --db.port int              Playground TiDB port. If not provided, TiDB will use 4000 as its port
       --db.binpath string        TiDB instance binary path
       --db.config string         TiDB instance configuration file
+      --db.timeout int           TiDB max wait time in seconds for starting, 0 means no limit
+      --drainer int              Drainer instance number
+      --drainer.binpath string   Drainer instance binary path
+      --drainer.config string    Drainer instance configuration file
+      --grafana.port int         grafana port. If not provided, grafana will use 3000 as its port. (default 3000)
   -h, --help                     help for tiup
-      --host string              Playground cluster host (default "127.0.0.1")
-      --kv int                   TiKV instance number (default 1)
+      --host string              Playground cluster host
+      --kv int                   TiKV instance number
       --kv.binpath string        TiKV instance binary path
       --kv.config string         TiKV instance configuration file
-      --monitor                  Start prometheus component
-      --pd int                   PD instance number (default 1)
+      --mode string              TiUP playground mode: 'tidb', 'tikv-slim' (default "tidb")
+      --pd int                   PD instance number
+      --pd.Host host             Playground PD host. If not provided, PD will still use host flag as its host
       --pd.binpath string        PD instance binary path
       --pd.config string         PD instance configuration file
+      --pump int                 Pump instance number
+      --pump.binpath string      Pump instance binary path
+      --pump.config string       Pump instance configuration file
+  -T, --tag string               Specify a tag for playground, data dir of this tag will not be removed after exit
+      --ticdc int                TiCDC instance number
+      --ticdc.binpath string     TiCDC instance binary path
+      --ticdc.config string      TiCDC instance configuration file
       --tiflash int              TiFlash instance number
       --tiflash.binpath string   TiFlash instance binary path
       --tiflash.config string    TiFlash instance configuration file
+      --tiflash.timeout int      TiFlash max wait time in seconds for starting, 0 means no limit
+  -v, --version                  version for tiup
+      --without-monitor          Don't start prometheus and grafana component
 ```
 
 ## Example
@@ -51,13 +81,19 @@ tiup playground nightly
 
 Nightly is the version number of this cluster, and similar ones can be `tiup playground v4.0.0-rc` etc.
 
-### Start a cluster with monitoring.
+### Start a cluster with or without monitoring.
 
 ```shell
-tiup playground nightly --monitor
+tiup playground nightly
 ```
 
-This command launches prometheus on port 9090 for displaying timing data within the cluster.
+This command launches Prometheus on port 9090 and Grafana on port 3000 for displaying timing data within the cluster.
+
+```shell
+tiup playground nightly --without-monitor
+```
+
+This won't launch Prometheus or Grafana. This can be used to save resources.
 
 ### Overrides the default configuration of the PD
 

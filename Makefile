@@ -1,4 +1,4 @@
-.PHONY: components server targets
+.PHONY: targets
 .DEFAULT_GOAL := default
 
 LANG=C
@@ -19,6 +19,7 @@ GOARCH  := $(if $(GOARCH),$(GOARCH),$(shell go env GOARCH))
 GOENV   := GO111MODULE=on CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH)
 GO      := $(GOENV) go
 GOBUILD := $(GO) build $(BUILD_FLAGS)
+GOINSTALL := $(GO) install
 GOTEST  := GO111MODULE=on CGO_ENABLED=1 go test -p 3
 SHELL   := /usr/bin/env bash
 
@@ -32,10 +33,10 @@ LDFLAGS += -X "$(REPO)/pkg/version.GitHash=$(COMMIT)"
 LDFLAGS += -X "$(REPO)/pkg/version.GitRef=$(GITREF)"
 LDFLAGS += $(EXTRA_LDFLAGS)
 
-FILES   := $$(find . -name "*.go")
+FILES   := $$(git ls-files --cached --others --exclude-standard '*.go' | while read -r f; do test -f "$$f" && echo "$$f"; done)
 
-FAILPOINT_ENABLE  := $$(tools/bin/failpoint-ctl enable)
-FAILPOINT_DISABLE := $$(tools/bin/failpoint-ctl disable)
+FAILPOINT_ENABLE  := $$(go tool github.com/pingcap/failpoint/failpoint-ctl enable)
+FAILPOINT_DISABLE := $$(go tool github.com/pingcap/failpoint/failpoint-ctl disable)
 
 default: check build
 	@# Target: run the checks and then build.
@@ -43,111 +44,119 @@ default: check build
 include ./tests/Makefile
 
 # Build TiUP and all components
+.PHONY: build
 build: tiup components
 	@# Target: build tiup and all it's components
 
-components: playground client cluster dm bench server
-	@# Target: build the playground, client, cluster, dm, bench and server components
+.PHONY: components
+components: playground client cluster dm server
+	@# Target: build the playground, client, cluster, dm and server components
 
+.PHONY: tiup
 tiup:
 	@# Target: build the tiup driver
 	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup
 
+.PHONY: playground
 playground:
 	@# Target: build tiup-playground component
 	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-playground ./components/playground
+	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-playground-ng ./components/playground-ng
 
+.PHONY: client
 client:
 	@# Target: build the tiup-client component
-	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-client ./components/client
+	$(MAKE) -C components/client $(MAKECMDGOALS)
 
+.PHONY: cluster
 cluster:
 	@# Target: build the tiup-cluster component
 	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-cluster ./components/cluster
 
+.PHONY: dm
 dm:
 	@# Target: build the tiup-dm component
 	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-dm ./components/dm
 
-bench:
-	@# Target: build the tiup-bench component
-	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-bench ./components/bench
-
-doc:
-	@# Target: build the tiup-doc component
-	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-doc ./components/doc
-
-errdoc:
-	@# Target: build the tiup-errdoc component
-	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-errdoc ./components/errdoc
-
+.PHONY: ctl
 ctl:
 	@# Target: build the tiup-ctl component
 	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-ctl ./components/ctl
 
+.PHONY: server
 server:
 	@# Target: build the tiup-server component
 	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/tiup-server ./server
 
+.PHONY: check
 check: fmt lint tidy check-static vet
 	@# Target: run all checkers. (fmt, lint, tidy, check-static and vet)
+	$(MAKE) -C components/client ${MAKECMDGOALS}
 
+.PHONY: check-static
 check-static: tools/bin/golangci-lint
 	@# Target: run the golangci-lint static check tool
-	tools/bin/golangci-lint run --config tools/check/golangci.yaml ./... --deadline=3m --fix
+	tools/bin/golangci-lint run --config tools/check/golangci.yaml ./... --timeout=3m --fix
 
-lint: tools/bin/revive
+.PHONY: lint
+lint:
 	@# Target: run the lint checker revive
 	@echo "linting"
-	./tools/check/check-lint.sh
-	@tools/bin/revive -formatter friendly -config tools/check/revive.toml $(FILES)
+	@go tool github.com/mgechev/revive -formatter friendly -config tools/check/revive.toml $(FILES)
 
+.PHONY: vet
 vet:
 	@# Target: run the go vet tool
 	$(GO) vet ./...
 
+.PHONY: tidy
 tidy:
 	@# Target: run tidy check
 	@echo "go mod tidy"
 	./tools/check/check-tidy.sh
 
+.PHONY: clean
 clean:
 	@# Target: run the build cleanup steps
 	@rm -rf bin
 	@rm -rf cover
 	@rm -rf tests/*/{bin/*.test,logs,cover/*.out}
 
+.PHONY: test
 test: failpoint-enable run-tests failpoint-disable
 	@# Target: run tests with failpoint enabled
+	$(MAKE) -C components/client ${MAKECMDGOALS}
 
 # TODO: refactor integration tests base on v1 manifest
 # run-tests: unit-test integration_test
+.PHONY: run-tests
 run-tests: unit-test
 	@# Target: run the unit tests
 
 # Run tests
+.PHONY: unit-test
 unit-test:
 	@# Target: run the code coverage test phase
 	mkdir -p cover
 	TIUP_HOME=$(shell pwd)/tests/tiup $(GOTEST) ./... -covermode=count -coverprofile cover/cov.unit-test.out
 
+.PHONY: race
 race: failpoint-enable
 	@# Target: run race check with failpoint enabled
 	TIUP_HOME=$(shell pwd)/tests/tiup $(GOTEST) -race ./...  || { $(FAILPOINT_DISABLE); exit 1; }
 	@$(FAILPOINT_DISABLE)
 
-failpoint-enable: tools/bin/failpoint-ctl
+.PHONY: failpoint-enable
+failpoint-enable:
 	@# Target: enable failpoint
 	@$(FAILPOINT_ENABLE)
 
-failpoint-disable: tools/bin/failpoint-ctl
+.PHONY: failpoint-disable
+failpoint-disable:
 	@# Target: disable failpoint
 	@$(FAILPOINT_DISABLE)
 
-tools/bin/failpoint-ctl: go.mod
-	@# Target: build the failpoint-ctl utility
-	$(GO) build -o $@ github.com/pingcap/failpoint/failpoint-ctl
-
+.PHONY: fmt
 fmt:
 	@# Target: run the go formatter utility
 	@echo "gofmt (simplify)"
@@ -155,11 +164,6 @@ fmt:
 	@echo "goimports (if installed)"
 	$(shell goimports -w $(FILES) 2>/dev/null)
 
-tools/bin/revive: tools/check/go.mod
-	@# Target: build revive utility
-	cd tools/check; \
-	$(GO) build -o ../bin/revive github.com/mgechev/revive
-
 tools/bin/golangci-lint:
-	@# Target: pull in specific version of golangci-lint (v1.38.0)
-	curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh| sh -s -- -b ./tools/bin v1.38.0
+	@# Target: pull in specific version of golangci-lint (v2.7.2)
+	curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b ./tools/bin v2.7.2

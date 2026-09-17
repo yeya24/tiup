@@ -20,6 +20,7 @@ import (
 	"github.com/pingcap/tiup/components/dm/spec"
 	"github.com/pingcap/tiup/pkg/cluster/api"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
+	tidbspec "github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
@@ -43,6 +44,14 @@ func newPruneCmd() *cobra.Command {
 
 			return clearOutDatedEtcdInfo(clusterName, metadata, gOpt)
 		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			switch len(args) {
+			case 0:
+				return shellCompGetClusterName(cm, toComplete)
+			default:
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+		},
 	}
 
 	return cmd
@@ -63,7 +72,11 @@ func clearOutDatedEtcdInfo(clusterName string, metadata *spec.Metadata, opt oper
 		existedWorkers[workerSpec.Name] = struct{}{}
 	}
 
-	dmMasterClient := api.NewDMMasterClient(topo.GetMasterList(), 10*time.Second, nil)
+	tlsCfg, err := topo.TLSConfig(dmspec.Path(clusterName, tidbspec.TLSCertKeyDir))
+	if err != nil {
+		return err
+	}
+	dmMasterClient := api.NewDMMasterClient(topo.GetMasterListWithManageHost(), 10*time.Second, tlsCfg)
 	registeredMasters, registeredWorkers, err := dmMasterClient.GetRegisteredMembers()
 	if err != nil {
 		return err
@@ -86,7 +99,6 @@ func clearOutDatedEtcdInfo(clusterName string, metadata *spec.Metadata, opt oper
 	var wg sync.WaitGroup
 
 	for _, master := range mastersToDelete {
-		master := master
 		wg.Add(1)
 		go func() {
 			errCh <- dmMasterClient.OfflineMaster(master, nil)
@@ -94,7 +106,6 @@ func clearOutDatedEtcdInfo(clusterName string, metadata *spec.Metadata, opt oper
 		}()
 	}
 	for _, worker := range workersToDelete {
-		worker := worker
 		wg.Add(1)
 		go func() {
 			errCh <- dmMasterClient.OfflineWorker(worker, nil)

@@ -27,6 +27,7 @@ type Mkdir struct {
 	user string
 	host string
 	dirs []string
+	sudo bool
 }
 
 // Execute implements the Task interface
@@ -49,16 +50,26 @@ func (m *Mkdir) Execute(ctx context.Context) error {
 		// 		test -d /a || (mkdir /a && chown tidb:tidb /a)
 		//		test -d /a/b || (mkdir /a/b && chown tidb:tidb /a/b)
 		//		test -d /a/b/c || (mkdir /a/b/c && chown tidb:tidb /a/b/c)
-		for i := 0; i < len(xs); i++ {
+		for i := range xs {
 			if xs[i] == "" {
 				continue
 			}
-			cmd := fmt.Sprintf(
-				`test -d %[1]s || (mkdir -p %[1]s && chown %[2]s:$(id -g -n %[2]s) %[1]s)`,
-				strings.Join(xs[:i+1], "/"),
-				m.user,
-			)
-			_, _, err := exec.Execute(ctx, cmd, true) // use root to create the dir
+
+			cmd := ""
+			if m.sudo {
+				cmd = fmt.Sprintf(
+					`test -d %[1]s || (mkdir -p %[1]s && chown %[2]s:$(id -g -n %[2]s) %[1]s)`,
+					strings.Join(xs[:i+1], "/"),
+					m.user,
+				)
+			} else {
+				cmd = fmt.Sprintf(
+					`test -d %[1]s || (mkdir -p %[1]s)`,
+					strings.Join(xs[:i+1], "/"),
+				)
+			}
+
+			_, _, err := exec.Execute(ctx, cmd, m.sudo) // use root to create the dir
 			if err != nil {
 				return errors.Trace(err)
 			}

@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -eu
+
 function scale_tools() {
     mkdir -p ~/.tiup/bin/
 
@@ -9,7 +11,7 @@ function scale_tools() {
 
     client=""
     if [ $native_ssh == true ]; then
-        client="--native-ssh"
+        client="--ssh=system"
     fi
 
     name="test_scale_tools_$RANDOM"
@@ -39,13 +41,13 @@ function scale_tools() {
     tiup-cluster $client display $name
 
     if [ $test_tls = true ]; then
-        total_sub_one=18
-        total=19
-        total_add_one=20
+        total_sub_one=19
+        total=20
+        total_add_one=21
     else
-        total_sub_one=20
-        total=21
-        total_add_one=22
+        total_sub_one=19
+        total=20
+        total_add_one=21
     fi
 
     echo "start scale in pump"
@@ -61,15 +63,6 @@ function scale_tools() {
     echo "start scale out cdc"
     topo=./topo/full_scale_in_cdc.yaml
     yes | tiup-cluster $client scale-out $name $topo
-
-    if [ $test_tls = false ]; then
-        echo "start scale in tispark"
-        yes | tiup-cluster $client --yes scale-in $name -N n4:7078
-        wait_instance_num_reach $name $total_sub_one $native_ssh
-        echo "start scale out tispark"
-        topo=./topo/full_scale_in_tispark.yaml
-        yes | tiup-cluster $client --yes scale-out $name $topo
-    fi
 
     echo "start scale in grafana"
     tiup-cluster $client --yes scale-in $name -N n1:3000
@@ -104,6 +97,7 @@ function scale_tools() {
         tiup-cluster $client exec $name -N n3 --command "ls /data/tiflash-data"
         echo "start scale in tiflash"
         tiup-cluster $client --yes scale-in $name -N n3:9000
+        sleep 20
         tiup-cluster $client display $name | grep Tombstone
         echo "start prune tiflash"
         yes | tiup-cluster $client prune $name
@@ -116,6 +110,7 @@ function scale_tools() {
     fi
 
     tiup-cluster $client _test $name writable
+    tiup-cluster $client --yes destroy $name
 
     # test cluster log dir
     tiup-cluster notfound-command 2>&1 | grep $HOME/.tiup/logs/tiup-cluster-debug

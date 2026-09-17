@@ -23,55 +23,100 @@ import (
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/crypto"
+	"github.com/pingcap/tiup/pkg/environment"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/proxy"
+	"github.com/pingcap/tiup/pkg/tui"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // Builder is used to build TiUP task
 type Builder struct {
-	tasks []Task
+	tasks  []Task
+	Logger *logprinter.Logger
 }
 
 // NewBuilder returns a *Builder instance
-func NewBuilder() *Builder {
-	return &Builder{}
+func NewBuilder(logger *logprinter.Logger) *Builder {
+	return &Builder{Logger: logger}
 }
 
 // RootSSH appends a RootSSH task to the current task collection
 func (b *Builder) RootSSH(
-	host string,
-	port int,
-	user, password, keyFile, passphrase string,
-	sshTimeout uint64,
-	sshType executor.SSHType,
-	defaultSSHType executor.SSHType,
+	host string, port int, user, password, keyFile, passphrase string, sshTimeout, exeTimeout uint64,
+	proxyHost string, proxyPort int, proxyUser, proxyPassword, proxyKeyFile, proxyPassphrase string, proxySSHTimeout uint64,
+	sshType, defaultSSHType executor.SSHType, sudo bool,
 ) *Builder {
 	if sshType == "" {
 		sshType = defaultSSHType
 	}
 	b.tasks = append(b.tasks, &RootSSH{
-		host:       host,
-		port:       port,
-		user:       user,
-		password:   password,
-		keyFile:    keyFile,
-		passphrase: passphrase,
-		timeout:    sshTimeout,
-		sshType:    sshType,
+		host:            host,
+		port:            port,
+		user:            user,
+		password:        password,
+		keyFile:         keyFile,
+		passphrase:      passphrase,
+		timeout:         sshTimeout,
+		exeTimeout:      exeTimeout,
+		proxyHost:       proxyHost,
+		proxyPort:       proxyPort,
+		proxyUser:       proxyUser,
+		proxyPassword:   proxyPassword,
+		proxyKeyFile:    proxyKeyFile,
+		proxyPassphrase: proxyPassphrase,
+		proxyTimeout:    proxySSHTimeout,
+		sshType:         sshType,
+		sudo:            sudo,
 	})
 	return b
 }
 
+// NewSimpleUerSSH  append a UserSSH task to the current task collection with operator.Options and SSHConnectionProps
+func NewSimpleUerSSH(logger *logprinter.Logger, host string, port int, user string, gOpt operator.Options, p *tui.SSHConnectionProps, sshType executor.SSHType) *Builder {
+	return NewBuilder(logger).
+		UserSSH(
+			host,
+			port,
+			user,
+			gOpt.SSHTimeout,
+			gOpt.OptTimeout,
+			gOpt.SSHProxyHost,
+			gOpt.SSHProxyPort,
+			gOpt.SSHProxyUser,
+			p.Password,
+			p.IdentityFile,
+			p.IdentityFilePassphrase,
+			gOpt.SSHProxyTimeout,
+			gOpt.SSHType,
+			sshType,
+		)
+}
+
 // UserSSH append a UserSSH task to the current task collection
-func (b *Builder) UserSSH(host string, port int, deployUser string, sshTimeout uint64, sshType, defaultSSHType executor.SSHType) *Builder {
+func (b *Builder) UserSSH(
+	host string, port int, deployUser string, sshTimeout, exeTimeout uint64,
+	proxyHost string, proxyPort int, proxyUser, proxyPassword, proxyKeyFile, proxyPassphrase string, proxySSHTimeout uint64,
+	sshType, defaultSSHType executor.SSHType,
+) *Builder {
 	if sshType == "" {
 		sshType = defaultSSHType
 	}
 	b.tasks = append(b.tasks, &UserSSH{
-		host:       host,
-		port:       port,
-		deployUser: deployUser,
-		timeout:    sshTimeout,
-		sshType:    sshType,
+		host:            host,
+		port:            port,
+		deployUser:      deployUser,
+		timeout:         sshTimeout,
+		exeTimeout:      exeTimeout,
+		proxyHost:       proxyHost,
+		proxyPort:       proxyPort,
+		proxyUser:       proxyUser,
+		proxyPassword:   proxyPassword,
+		proxyKeyFile:    proxyKeyFile,
+		proxyPassphrase: proxyPassphrase,
+		proxyTimeout:    proxySSHTimeout,
+		sshType:         sshType,
 	})
 	return b
 }
@@ -86,22 +131,33 @@ func (b *Builder) Func(name string, fn func(ctx context.Context) error) *Builder
 }
 
 // ClusterSSH init all UserSSH need for the cluster.
-func (b *Builder) ClusterSSH(spec spec.Topology, deployUser string, sshTimeout uint64, sshType, defaultSSHType executor.SSHType) *Builder {
+func (b *Builder) ClusterSSH(
+	topo spec.Topology,
+	deployUser string, sshTimeout, exeTimeout uint64,
+	proxyHost string, proxyPort int, proxyUser, proxyPassword, proxyKeyFile, proxyPassphrase string, proxySSHTimeout uint64,
+	sshType, defaultSSHType executor.SSHType,
+) *Builder {
 	if sshType == "" {
 		sshType = defaultSSHType
 	}
 	var tasks []Task
-	for _, com := range spec.ComponentsByStartOrder() {
-		for _, in := range com.Instances() {
-			tasks = append(tasks, &UserSSH{
-				host:       in.GetHost(),
-				port:       in.GetSSHPort(),
-				deployUser: deployUser,
-				timeout:    sshTimeout,
-				sshType:    sshType,
-			})
-		}
-	}
+	topo.IterInstance(func(inst spec.Instance) {
+		tasks = append(tasks, &UserSSH{
+			host:            inst.GetManageHost(),
+			port:            inst.GetSSHPort(),
+			deployUser:      deployUser,
+			timeout:         sshTimeout,
+			exeTimeout:      exeTimeout,
+			proxyHost:       proxyHost,
+			proxyPort:       proxyPort,
+			proxyUser:       proxyUser,
+			proxyPassword:   proxyPassword,
+			proxyKeyFile:    proxyKeyFile,
+			proxyPassphrase: proxyPassphrase,
+			proxyTimeout:    proxySSHTimeout,
+			sshType:         sshType,
+		})
+	})
 
 	b.tasks = append(b.tasks, &Parallel{inner: tasks})
 
@@ -109,33 +165,36 @@ func (b *Builder) ClusterSSH(spec spec.Topology, deployUser string, sshTimeout u
 }
 
 // UpdateMeta maintain the meta information
-func (b *Builder) UpdateMeta(cluster string, metadata *spec.ClusterMeta, deletedNodeIds []string) *Builder {
+func (b *Builder) UpdateMeta(cluster string, metadata *spec.ClusterMeta, deletedNodeIDs []string) *Builder {
 	b.tasks = append(b.tasks, &UpdateMeta{
 		cluster:        cluster,
 		metadata:       metadata,
-		deletedNodeIDs: deletedNodeIds,
+		deletedNodeIDs: deletedNodeIDs,
 	})
 	return b
 }
 
 // UpdateTopology maintain the topology information
-func (b *Builder) UpdateTopology(cluster, profile string, metadata *spec.ClusterMeta, deletedNodeIds []string) *Builder {
+func (b *Builder) UpdateTopology(cluster, profile string, metadata *spec.ClusterMeta, deletedNodeIDs []string) *Builder {
 	b.tasks = append(b.tasks, &UpdateTopology{
 		metadata:       metadata,
 		cluster:        cluster,
 		profileDir:     profile,
-		deletedNodeIDs: deletedNodeIds,
+		deletedNodeIDs: deletedNodeIDs,
+		tcpProxy:       proxy.GetTCPProxy(),
 	})
 	return b
 }
 
 // CopyFile appends a CopyFile task to the current task collection
-func (b *Builder) CopyFile(src, dst, server string, download bool) *Builder {
+func (b *Builder) CopyFile(src, dst, server string, download bool, limit int, compress bool) *Builder {
 	b.tasks = append(b.tasks, &CopyFile{
 		src:      src,
 		dst:      dst,
 		remote:   server,
 		download: download,
+		limit:    limit,
+		compress: compress,
 	})
 	return b
 }
@@ -185,11 +244,32 @@ func (b *Builder) BackupComponent(component, fromVer string, host, deployDir str
 }
 
 // InitConfig appends a CopyComponent task to the current task collection
-func (b *Builder) InitConfig(clusterName, clusterVersion string, specManager *spec.SpecManager, inst spec.Instance, deployUser string, ignoreCheck bool, paths meta.DirPaths) *Builder {
+func (b *Builder) InitConfig(clusterName, version string, specManager *spec.SpecManager, inst spec.Instance, deployUser string, ignoreCheck bool, paths meta.DirPaths) *Builder {
+	// get nightly version
+	var componentVersion utils.Version
+	meta := specManager.NewMetadata()
+
+	//  full version
+	componentVersion = utils.Version(version)
+	if err := specManager.Metadata(clusterName, meta); err == nil {
+		// get nightly version
+		if version == utils.NightlyVersionAlias {
+			componentVersion, _, err = environment.GlobalEnv().V1Repository().LatestNightlyVersion(inst.ComponentSource())
+			if err != nil {
+				componentVersion = utils.Version(version)
+			}
+		}
+
+		// dm cluster does not require a full nightly version
+		if meta.GetTopology().Type() == spec.TopoTypeDM {
+			componentVersion = utils.Version(version)
+		}
+	}
+
 	b.tasks = append(b.tasks, &InitConfig{
 		specManager:    specManager,
 		clusterName:    clusterName,
-		clusterVersion: clusterVersion,
+		clusterVersion: string(componentVersion),
 		instance:       inst,
 		deployUser:     deployUser,
 		ignoreCheck:    ignoreCheck,
@@ -213,15 +293,17 @@ func (b *Builder) ScaleConfig(clusterName, clusterVersion string, specManager *s
 }
 
 // MonitoredConfig appends a CopyComponent task to the current task collection
-func (b *Builder) MonitoredConfig(name, comp, host string, globResCtl meta.ResourceControl, options *spec.MonitoredOptions, deployUser string, paths meta.DirPaths) *Builder {
+func (b *Builder) MonitoredConfig(name, comp, host string, globResCtl meta.ResourceControl, options *spec.MonitoredOptions, deployUser string, tlsEnabled bool, paths meta.DirPaths, systemdMode spec.SystemdMode) *Builder {
 	b.tasks = append(b.tasks, &MonitoredConfig{
-		name:       name,
-		component:  comp,
-		host:       host,
-		globResCtl: globResCtl,
-		options:    options,
-		deployUser: deployUser,
-		paths:      paths,
+		name:        name,
+		component:   comp,
+		host:        host,
+		globResCtl:  globResCtl,
+		options:     options,
+		deployUser:  deployUser,
+		tlsEnabled:  tlsEnabled,
+		paths:       paths,
+		systemdMode: systemdMode,
 	})
 	return b
 }
@@ -244,12 +326,23 @@ func (b *Builder) SSHKeySet(privKeyPath, pubKeyPath string) *Builder {
 }
 
 // EnvInit appends a EnvInit task to the current task collection
-func (b *Builder) EnvInit(host, deployUser string, userGroup string, skipCreateUser bool) *Builder {
+func (b *Builder) EnvInit(host, deployUser string, userGroup string, skipCreateUser bool, sudo bool) *Builder {
 	b.tasks = append(b.tasks, &EnvInit{
 		host:           host,
 		deployUser:     deployUser,
 		userGroup:      userGroup,
 		skipCreateUser: skipCreateUser,
+		sudo:           sudo,
+	})
+	return b
+}
+
+// RotateSSH appends a RotateSSH task to the current task collection
+func (b *Builder) RotateSSH(host, deployUser, newPublicKeyPath string) *Builder {
+	b.tasks = append(b.tasks, &RotateSSH{
+		host:             host,
+		deployUser:       deployUser,
+		newPublicKeyPath: newPublicKeyPath,
 	})
 	return b
 }
@@ -273,11 +366,12 @@ func (b *Builder) ClusterOperate(
 }
 
 // Mkdir appends a Mkdir task to the current task collection
-func (b *Builder) Mkdir(user, host string, dirs ...string) *Builder {
+func (b *Builder) Mkdir(user, host string, sudo bool, dirs ...string) *Builder {
 	b.tasks = append(b.tasks, &Mkdir{
 		user: user,
 		host: host,
 		dirs: dirs,
+		sudo: sudo,
 	})
 	return b
 }
@@ -302,35 +396,51 @@ func (b *Builder) Shell(host, command, cmdID string, sudo bool) *Builder {
 	return b
 }
 
+// ShellIgnoreNonZero runs a shell command on cluster host and ignores the command exit status.
+func (b *Builder) ShellIgnoreNonZero(host, command, cmdID string, sudo bool) *Builder {
+	b.tasks = append(b.tasks, &Shell{
+		host:          host,
+		command:       command,
+		sudo:          sudo,
+		cmdID:         cmdID,
+		ignoreNonZero: true,
+	})
+	return b
+}
+
 // SystemCtl run systemctl on host
-func (b *Builder) SystemCtl(host, unit, action string, daemonReload bool) *Builder {
+func (b *Builder) SystemCtl(host, unit, action string, daemonReload, checkActive bool, scope string) *Builder {
 	b.tasks = append(b.tasks, &SystemCtl{
 		host:         host,
 		unit:         unit,
 		action:       action,
 		daemonReload: daemonReload,
+		checkactive:  checkActive,
+		scope:        scope,
 	})
 	return b
 }
 
 // Sysctl set a kernel parameter
-func (b *Builder) Sysctl(host, key, val string) *Builder {
+func (b *Builder) Sysctl(host, key, val string, sudo bool) *Builder {
 	b.tasks = append(b.tasks, &Sysctl{
 		host: host,
 		key:  key,
 		val:  val,
+		sudo: sudo,
 	})
 	return b
 }
 
 // Limit set a system limit
-func (b *Builder) Limit(host, domain, limit, item, value string) *Builder {
+func (b *Builder) Limit(host, domain, limit, item, value string, sudo bool) *Builder {
 	b.tasks = append(b.tasks, &Limit{
 		host:   host,
 		domain: domain,
 		limit:  limit,
 		item:   item,
 		value:  value,
+		sudo:   sudo,
 	})
 	return b
 }
@@ -356,10 +466,10 @@ func (b *Builder) DeploySpark(inst spec.Instance, sparkVersion, srcPath, deployD
 		inst.Arch(),
 		sparkVersion,
 		srcPath,
-		inst.GetHost(),
+		inst.GetManageHost(),
 		deployDir,
 	).Shell( // spark is under a subdir, move it to deploy dir
-		inst.GetHost(),
+		inst.GetManageHost(),
 		fmt.Sprintf(
 			"cp -rf %[1]s %[2]s/ && cp -rf %[3]s/* %[2]s/ && rm -rf %[1]s %[3]s",
 			filepath.Join(deployDir, "bin", sparkSubPath),
@@ -374,10 +484,10 @@ func (b *Builder) DeploySpark(inst spec.Instance, sparkVersion, srcPath, deployD
 		inst.Arch(),
 		"", // use the latest stable version
 		srcPath,
-		inst.GetHost(),
+		inst.GetManageHost(),
 		deployDir,
 	).Shell( // move tispark jar to correct path
-		inst.GetHost(),
+		inst.GetManageHost(),
 		fmt.Sprintf(
 			"cp -f %[1]s/*.jar %[2]s/jars/ && rm -f %[1]s/*.jar",
 			filepath.Join(deployDir, "bin"),
@@ -389,10 +499,13 @@ func (b *Builder) DeploySpark(inst spec.Instance, sparkVersion, srcPath, deployD
 }
 
 // TLSCert generates certificate for instance and transfers it to the server
-func (b *Builder) TLSCert(inst spec.Instance, ca *crypto.CertificateAuthority, paths meta.DirPaths) *Builder {
+func (b *Builder) TLSCert(host, comp, role string, port int, ca *crypto.CertificateAuthority, paths meta.DirPaths) *Builder {
 	b.tasks = append(b.tasks, &TLSCert{
+		host:  host,
+		comp:  comp,
+		role:  role,
+		port:  port,
 		ca:    ca,
-		inst:  inst,
 		paths: paths,
 	})
 	return b
@@ -424,20 +537,20 @@ func (b *Builder) Build() Task {
 }
 
 // Step appends a new StepDisplay task, which will print single line progress for inner tasks.
-func (b *Builder) Step(prefix string, inner Task) *Builder {
-	b.Serial(newStepDisplay(prefix, inner))
+func (b *Builder) Step(prefix string, inner Task, logger *logprinter.Logger) *Builder {
+	b.Serial(newStepDisplay(prefix, inner, logger))
 	return b
 }
 
 // ParallelStep appends a new ParallelStepDisplay task, which will print multi line progress in parallel
 // for inner tasks. Inner tasks must be a StepDisplay task.
 func (b *Builder) ParallelStep(prefix string, ignoreError bool, tasks ...*StepDisplay) *Builder {
-	b.tasks = append(b.tasks, newParallelStepDisplay(prefix, ignoreError, tasks...))
+	b.tasks = append(b.tasks, newParallelStepDisplay(prefix, ignoreError, tasks...).SetLogger(b.Logger))
 	return b
 }
 
 // BuildAsStep returns a task that is wrapped by a StepDisplay. The task will print single line progress.
 func (b *Builder) BuildAsStep(prefix string) *StepDisplay {
 	inner := b.Build()
-	return newStepDisplay(prefix, inner)
+	return newStepDisplay(prefix, inner, b.Logger)
 }

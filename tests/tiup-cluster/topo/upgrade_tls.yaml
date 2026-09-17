@@ -6,7 +6,7 @@ server_configs:
     binlog.enable: true
     binlog.ignore-error: false
   tikv:
-    storage.reserve-space: 1K
+    storage.reserve-space: 5M
   pump:
     storage.stop-write-at-available-space: 1 mib
 
@@ -41,6 +41,9 @@ drainer_servers:
 
 monitoring_servers:
   - host: n1
+    external_labels:
+      environment: production
+      region: us-east-1
 grafana_servers:
   - host: n1
 alertmanager_servers:

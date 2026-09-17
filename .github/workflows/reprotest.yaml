@@ -9,6 +9,7 @@ on:
     branches:
       - master
       - release-*
+      - feature/*
     paths-ignore:
       - '**.html'
       - '**.md'
@@ -30,21 +31,16 @@ on:
 jobs:
   reprotest:
     # The type of runner that the job will run on
-    runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        go:
-          - 1.16.x
+    runs-on: ubuntu-22.04
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
 
-      - name: Set up Go ${{ matrix.go }}
-        uses: actions/setup-go@v2
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          go-version: ${{ matrix.go }}
+          go-version-file: 'go.mod'
 
       - name: Install reprotest and prepare
         id: prepare_env
@@ -60,6 +56,6 @@ jobs:
             GOROOT=${{ steps.prepare_env.GOROOT }} \
             GOPATH=${{ steps.prepare_env.GOPATH }} \
             PATH=$GOROOT/bin:$PATH \
-            BUILD_FLAGS='-trimpath -buildmode=pie' \
+            BUILD_FLAGS='-trimpath -buildmode=pie -mod=readonly -modcacherw -buildvcs=false' \
             make build" \
           bin

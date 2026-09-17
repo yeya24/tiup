@@ -20,24 +20,21 @@ import (
 
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/meta"
-
-	"github.com/pingcap/check"
-	"github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/utils/mock"
+
+	"github.com/pingcap/errors"
+	"github.com/stretchr/testify/require"
 )
 
-type initConfigSuite struct {
-}
-
-type fakeExecutor struct {
-}
+type fakeExecutor struct{}
 
 func (e *fakeExecutor) Execute(ctx context.Context, cmd string, sudo bool, timeout ...time.Duration) (stdout []byte, stderr []byte, err error) {
 	return []byte{}, []byte{}, nil
 }
 
-func (e *fakeExecutor) Transfer(ctx context.Context, src string, dst string, download bool) error {
+func (e *fakeExecutor) Transfer(ctx context.Context, src, dst string, download bool, limit int, compress bool) error {
 	return nil
 }
 
@@ -68,17 +65,18 @@ func (i *fakeInstance) GetPort() int {
 	return 4000
 }
 
-func Test(t *testing.T) { check.TestingT(t) }
+func (i *fakeInstance) GetManageHost() string {
+	return "1.1.1.1"
+}
 
-var _ = check.Suite(&initConfigSuite{})
+func TestCheckConfig(t *testing.T) {
+	ctx := ctxt.New(context.Background(), 0, logprinter.NewLogger(""))
+	mf := mock.With("FakeExecutor", &fakeExecutor{})
+	defer mf()
 
-func (s *initConfigSuite) TestCheckConfig(c *check.C) {
-	ctx := ctxt.New(context.Background())
-	defer mock.With("FakeExecutor", &fakeExecutor{})()
-
-	t := &InitConfig{
+	initCfg := &InitConfig{
 		clusterName:    "test-cluster-name",
-		clusterVersion: "v4.0.0",
+		clusterVersion: "v6.0.0",
 		paths: meta.DirPaths{
 			Cache: "/tmp",
 		},
@@ -92,12 +90,12 @@ func (s *initConfigSuite) TestCheckConfig(c *check.C) {
 	}
 
 	for _, test := range tests {
-		t.instance = &fakeInstance{test[0], nil}
-		t.ignoreCheck = test[1]
+		initCfg.instance = &fakeInstance{test[0], nil}
+		initCfg.ignoreCheck = test[1]
 		if test[2] {
-			c.Assert(t.Execute(ctx), check.NotNil)
+			require.Error(t, initCfg.Execute(ctx))
 		} else {
-			c.Assert(t.Execute(ctx), check.IsNil)
+			require.NoError(t, initCfg.Execute(ctx))
 		}
 	}
 }

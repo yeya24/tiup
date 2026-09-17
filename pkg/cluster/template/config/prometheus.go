@@ -15,37 +15,49 @@ package config
 
 import (
 	"bytes"
-	"fmt"
-	"os"
 	"path"
+	"strconv"
+	"strings"
 	"text/template"
 
 	"github.com/pingcap/tiup/embed"
+	"github.com/pingcap/tiup/pkg/tidbver"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // PrometheusConfig represent the data to generate Prometheus config
 type PrometheusConfig struct {
-	ClusterName               string
-	TLSEnabled                bool
-	KafkaAddrs                []string
+	ClusterName    string
+	ScrapeInterval string
+	ScrapeTimeout  string
+	TLSEnabled     bool
+	// ExternalLabels holds user-defined entries merged into global.external_labels.
+	ExternalLabels            map[string]string
 	NodeExporterAddrs         []string
 	TiDBStatusAddrs           []string
+	TiProxyStatusAddrs        []string
 	TiKVStatusAddrs           []string
+	TiKVWorkerAddrs           []string
 	PDAddrs                   []string
+	TSOAddrs                  []string
+	SchedulingAddrs           []string
+	RouterAddrs               []string
+	ResourceManagerAddrs      []string
 	TiFlashStatusAddrs        []string
 	TiFlashLearnerStatusAddrs []string
 	PumpAddrs                 []string
 	DrainerAddrs              []string
 	CDCAddrs                  []string
-	ZookeeperAddrs            []string
+	TiKVCDCAddrs              []string
 	BlackboxExporterAddrs     []string
 	LightningAddrs            []string
 	MonitoredServers          []string
 	AlertmanagerAddrs         []string
-	PushgatewayAddr           string
+	NGMonitoringAddrs         []string
+	PushgatewayAddrs          []string
 	BlackboxAddr              string
-	KafkaExporterAddr         string
 	GrafanaAddr               string
+	HasTiKVAccelerateRules    bool
 
 	DMMasterAddrs []string
 	DMWorkerAddrs []string
@@ -55,88 +67,121 @@ type PrometheusConfig struct {
 }
 
 // NewPrometheusConfig returns a PrometheusConfig
-func NewPrometheusConfig(cluster string, enableTLS bool) *PrometheusConfig {
-	return &PrometheusConfig{
-		ClusterName: cluster,
-		TLSEnabled:  enableTLS,
+func NewPrometheusConfig(clusterName, clusterVersion string, enableTLS bool) *PrometheusConfig {
+	cfg := &PrometheusConfig{
+		ClusterName:            clusterName,
+		TLSEnabled:             enableTLS,
+		HasTiKVAccelerateRules: tidbver.PrometheusHasTiKVAccelerateRules(clusterVersion),
 	}
-}
 
-// AddKafka add a kafka address
-func (c *PrometheusConfig) AddKafka(ip string, port uint64) *PrometheusConfig {
-	c.KafkaAddrs = append(c.KafkaAddrs, fmt.Sprintf("%s:%d", ip, port))
-	return c
+	return cfg
 }
 
 // AddNodeExpoertor add a node expoter address
 func (c *PrometheusConfig) AddNodeExpoertor(ip string, port uint64) *PrometheusConfig {
-	c.NodeExporterAddrs = append(c.NodeExporterAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.NodeExporterAddrs = append(c.NodeExporterAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddTiDB add a TiDB address
 func (c *PrometheusConfig) AddTiDB(ip string, port uint64) *PrometheusConfig {
-	c.TiDBStatusAddrs = append(c.TiDBStatusAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.TiDBStatusAddrs = append(c.TiDBStatusAddrs, utils.JoinHostPort(ip, int(port)))
+	return c
+}
+
+// AddTiProxy add a TiProxy address
+func (c *PrometheusConfig) AddTiProxy(ip string, port uint64) *PrometheusConfig {
+	c.TiProxyStatusAddrs = append(c.TiProxyStatusAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddTiKV add a TiKV address
 func (c *PrometheusConfig) AddTiKV(ip string, port uint64) *PrometheusConfig {
-	c.TiKVStatusAddrs = append(c.TiKVStatusAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.TiKVStatusAddrs = append(c.TiKVStatusAddrs, utils.JoinHostPort(ip, int(port)))
+	return c
+}
+
+// AddTiKVWorker add a tikv-worker address.
+func (c *PrometheusConfig) AddTiKVWorker(ip string, port uint64) *PrometheusConfig {
+	c.TiKVWorkerAddrs = append(c.TiKVWorkerAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddPD add a PD address
 func (c *PrometheusConfig) AddPD(ip string, port uint64) *PrometheusConfig {
-	c.PDAddrs = append(c.PDAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.PDAddrs = append(c.PDAddrs, utils.JoinHostPort(ip, int(port)))
+	return c
+}
+
+// AddTSO add a TSO address
+func (c *PrometheusConfig) AddTSO(ip string, port uint64) *PrometheusConfig {
+	c.TSOAddrs = append(c.TSOAddrs, utils.JoinHostPort(ip, int(port)))
+	return c
+}
+
+// AddScheduling add a scheduling address
+func (c *PrometheusConfig) AddScheduling(ip string, port uint64) *PrometheusConfig {
+	c.SchedulingAddrs = append(c.SchedulingAddrs, utils.JoinHostPort(ip, int(port)))
+	return c
+}
+
+// AddRouter add a router address
+func (c *PrometheusConfig) AddRouter(ip string, port uint64) *PrometheusConfig {
+	c.RouterAddrs = append(c.RouterAddrs, utils.JoinHostPort(ip, int(port)))
+	return c
+}
+
+// AddResourceManager add a resource manager address
+func (c *PrometheusConfig) AddResourceManager(ip string, port uint64) *PrometheusConfig {
+	c.ResourceManagerAddrs = append(c.ResourceManagerAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddTiFlashLearner add a TiFlash learner address
 func (c *PrometheusConfig) AddTiFlashLearner(ip string, port uint64) *PrometheusConfig {
-	c.TiFlashLearnerStatusAddrs = append(c.TiFlashLearnerStatusAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.TiFlashLearnerStatusAddrs = append(c.TiFlashLearnerStatusAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddTiFlash add a TiFlash address
 func (c *PrometheusConfig) AddTiFlash(ip string, port uint64) *PrometheusConfig {
-	c.TiFlashStatusAddrs = append(c.TiFlashStatusAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.TiFlashStatusAddrs = append(c.TiFlashStatusAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddPump add a pump address
 func (c *PrometheusConfig) AddPump(ip string, port uint64) *PrometheusConfig {
-	c.PumpAddrs = append(c.PumpAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.PumpAddrs = append(c.PumpAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddDrainer add a drainer address
 func (c *PrometheusConfig) AddDrainer(ip string, port uint64) *PrometheusConfig {
-	c.DrainerAddrs = append(c.DrainerAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.DrainerAddrs = append(c.DrainerAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddCDC add a cdc address
 func (c *PrometheusConfig) AddCDC(ip string, port uint64) *PrometheusConfig {
-	c.CDCAddrs = append(c.CDCAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.CDCAddrs = append(c.CDCAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
-// AddZooKeeper add a zookeeper address
-func (c *PrometheusConfig) AddZooKeeper(ip string, port uint64) *PrometheusConfig {
-	c.ZookeeperAddrs = append(c.ZookeeperAddrs, fmt.Sprintf("%s:%d", ip, port))
+// AddTiKVCDC add a tikv-cdc address
+func (c *PrometheusConfig) AddTiKVCDC(ip string, port uint64) *PrometheusConfig {
+	c.TiKVCDCAddrs = append(c.TiKVCDCAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddBlackboxExporter add a BlackboxExporter address
 func (c *PrometheusConfig) AddBlackboxExporter(ip string, port uint64) *PrometheusConfig {
-	c.BlackboxExporterAddrs = append(c.BlackboxExporterAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.BlackboxExporterAddrs = append(c.BlackboxExporterAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddLightning add a lightning address
 func (c *PrometheusConfig) AddLightning(ip string, port uint64) *PrometheusConfig {
-	c.LightningAddrs = append(c.LightningAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.LightningAddrs = append(c.LightningAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
@@ -148,43 +193,43 @@ func (c *PrometheusConfig) AddMonitoredServer(ip string) *PrometheusConfig {
 
 // AddAlertmanager add an alertmanager address
 func (c *PrometheusConfig) AddAlertmanager(ip string, port uint64) *PrometheusConfig {
-	c.AlertmanagerAddrs = append(c.AlertmanagerAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.AlertmanagerAddrs = append(c.AlertmanagerAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddPushgateway add an pushgateway address
-func (c *PrometheusConfig) AddPushgateway(ip string, port uint64) *PrometheusConfig {
-	c.PushgatewayAddr = fmt.Sprintf("%s:%d", ip, port)
+func (c *PrometheusConfig) AddPushgateway(addresses []string) *PrometheusConfig {
+	c.PushgatewayAddrs = addresses
 	return c
 }
 
 // AddBlackbox add an blackbox address
 func (c *PrometheusConfig) AddBlackbox(ip string, port uint64) *PrometheusConfig {
-	c.BlackboxAddr = fmt.Sprintf("%s:%d", ip, port)
+	c.BlackboxAddr = utils.JoinHostPort(ip, int(port))
 	return c
 }
 
-// AddKafkaExporter add an kafka exporter address
-func (c *PrometheusConfig) AddKafkaExporter(ip string, port uint64) *PrometheusConfig {
-	c.KafkaExporterAddr = fmt.Sprintf("%s:%d", ip, port)
+// AddNGMonitoring add an ng-monitoring server exporter address
+func (c *PrometheusConfig) AddNGMonitoring(ip string, port uint64) *PrometheusConfig {
+	c.NGMonitoringAddrs = append(c.NGMonitoringAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
-// AddGrafana add an kafka exporter address
+// AddGrafana add an Grafana address
 func (c *PrometheusConfig) AddGrafana(ip string, port uint64) *PrometheusConfig {
-	c.GrafanaAddr = fmt.Sprintf("%s:%d", ip, port)
+	c.GrafanaAddr = utils.JoinHostPort(ip, int(port))
 	return c
 }
 
 // AddDMMaster add an dm-master address
 func (c *PrometheusConfig) AddDMMaster(ip string, port uint64) *PrometheusConfig {
-	c.DMMasterAddrs = append(c.DMMasterAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.DMMasterAddrs = append(c.DMMasterAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
 // AddDMWorker add an dm-worker address
 func (c *PrometheusConfig) AddDMWorker(ip string, port uint64) *PrometheusConfig {
-	c.DMWorkerAddrs = append(c.DMWorkerAddrs, fmt.Sprintf("%s:%d", ip, port))
+	c.DMWorkerAddrs = append(c.DMWorkerAddrs, utils.JoinHostPort(ip, int(port)))
 	return c
 }
 
@@ -200,19 +245,70 @@ func (c *PrometheusConfig) SetRemoteConfig(cfg string) *PrometheusConfig {
 	return c
 }
 
+// SetExternalLabels sets custom Prometheus external labels.
+func (c *PrometheusConfig) SetExternalLabels(labels map[string]string) *PrometheusConfig {
+	if len(labels) == 0 {
+		return c
+	}
+
+	// Copy the input map so later caller mutations do not change the config object.
+	c.ExternalLabels = make(map[string]string, len(labels))
+	for key, value := range labels {
+		c.ExternalLabels[key] = value
+	}
+	return c
+}
+
 // Config generate the config file data.
 func (c *PrometheusConfig) Config() ([]byte, error) {
 	fp := path.Join("templates", "config", "prometheus.yml.tpl")
-	tpl, err := embed.ReadFile(fp)
+	tpl, err := embed.ReadTemplate(fp)
 	if err != nil {
 		return nil, err
 	}
 	return c.ConfigWithTemplate(string(tpl))
 }
 
+// ConfigWithAgentMode generate the config file data with agent mode enabled/disabled.
+// In agent mode, we need to exclude rule_files section which is not supported.
+func (c *PrometheusConfig) ConfigWithAgentMode(enableAgent bool) ([]byte, error) {
+	fp := path.Join("templates", "config", "prometheus.yml.tpl")
+	tpl, err := embed.ReadTemplate(fp)
+	if err != nil {
+		return nil, err
+	}
+
+	// If agent mode is enabled, remove rule_files section from the template
+	if enableAgent {
+		// Remove the rule_files section which isn't allowed in agent mode
+		// This is a simple string manipulation to remove the section - a more robust approach
+		// would be to create a dedicated template for agent mode
+		tplContent := string(tpl)
+		ruleSectionStart := "rule_files:"
+		startIndex := strings.Index(tplContent, ruleSectionStart)
+
+		if startIndex >= 0 {
+			// Find the end of the rule_files section (next section with same indentation)
+			scrapeConfigsSection := "scrape_configs:"
+			endIndex := strings.Index(tplContent[startIndex:], scrapeConfigsSection)
+
+			if endIndex >= 0 {
+				// Build a new template without the rule_files section
+				newTemplate := tplContent[:startIndex] + tplContent[startIndex+endIndex:]
+				return c.ConfigWithTemplate(newTemplate)
+			}
+		}
+	}
+
+	return c.ConfigWithTemplate(string(tpl))
+}
+
 // ConfigWithTemplate generate the Prometheus config content by tpl
 func (c *PrometheusConfig) ConfigWithTemplate(tpl string) ([]byte, error) {
-	tmpl, err := template.New("Prometheus").Parse(tpl)
+	// yamlQuote keeps label values valid even when they contain quotes or other special characters.
+	tmpl, err := template.New("Prometheus").Funcs(template.FuncMap{
+		"yamlQuote": strconv.Quote,
+	}).Parse(tpl)
 	if err != nil {
 		return nil, err
 	}
@@ -231,5 +327,5 @@ func (c *PrometheusConfig) ConfigToFile(file string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(file, config, 0755)
+	return utils.WriteFile(file, config, 0755)
 }

@@ -38,7 +38,6 @@ You can retain some nodes and roles data when destroy cluster, eg:
 			}
 
 			clusterName := args[0]
-			teleCommand = append(teleCommand, scrubClusterName(clusterName))
 
 			// Validate the retained roles to prevent unexpected deleting data
 			if len(destroyOpt.RetainDataRoles) > 0 {
@@ -51,6 +50,14 @@ You can retain some nodes and roles data when destroy cluster, eg:
 			}
 
 			return cm.DestroyCluster(clusterName, gOpt, destroyOpt, skipConfirm)
+		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			switch len(args) {
+			case 0:
+				return shellCompGetClusterName(cm, toComplete)
+			default:
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
 		},
 	}
 

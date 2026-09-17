@@ -26,19 +26,60 @@ import (
 	"github.com/pingcap/tiup/pkg/repository"
 	"github.com/pingcap/tiup/pkg/repository/v1manifest"
 	"github.com/pingcap/tiup/pkg/utils"
-	"github.com/pingcap/tiup/pkg/verbose"
+	"go.uber.org/zap"
 	"golang.org/x/mod/semver"
-)
-
-// Name of components
-const (
-	tiupName = "tiup"
 )
 
 var (
 	// ErrInstallFirst indicates that a component/version is not installed
 	ErrInstallFirst = errors.New("component not installed")
 )
+
+// EnvList is the canonical allowlist of environment variables TiUP will print or expose.
+// Keep this list as the single source of truth for env visibility.
+var EnvList = []string{
+	// Core locations and versions
+	localdata.EnvNameHome,
+	localdata.EnvNameWorkDir,
+	localdata.EnvNameUserInputVersion,
+	localdata.EnvNameTiUPVersion,
+
+	// Telemetry identifiers and status
+	localdata.EnvNameTelemetryStatus,
+	localdata.EnvNameTelemetryUUID,
+	localdata.EnvNameTelemetryEventUUID,
+	localdata.EnvNameTelemetrySecret,
+
+	// Component/instance directories
+	localdata.EnvNameInstanceDataDir,
+	localdata.EnvNameComponentDataDir,
+	localdata.EnvNameComponentInstallDir,
+
+	// SSH and copy tools configuration
+	localdata.EnvNameSSHPassPrompt,
+	localdata.EnvNameNativeSSHClient,
+	localdata.EnvNameSSHPath,
+	localdata.EnvNameSCPPath,
+
+	// Misc runtime controls
+	localdata.EnvNameKeepSourceTarget,
+	localdata.EnvNameMirrorSyncScript,
+	localdata.EnvNameLogPath,
+	localdata.EnvNameDebug,
+	localdata.EnvTag,
+}
+
+// WhitelistedEnvs returns only the environment variables defined in EnvList,
+// formatted as KEY=VALUE strings. Empty values are omitted.
+func WhitelistedEnvs() []string {
+	var envs []string
+	for _, key := range EnvList {
+		if val := os.Getenv(key); val != "" {
+			envs = append(envs, fmt.Sprintf("%s=%s", key, val))
+		}
+	}
+	return envs
+}
 
 // Mirror return mirror of tiup.
 // If it's not defined, it will use "https://tiup-mirrors.pingcap.com/".
@@ -49,14 +90,14 @@ func Mirror() string {
 	reset := func(m string) {
 		os.Setenv(repository.EnvMirrors, m)
 		if err := profile.ResetMirror(m, ""); err != nil {
-			fmt.Printf("WARNING: reset mirror failed, %s\n", err.Error())
+			fmt.Fprintf(os.Stderr, "WARNING: reset mirror failed, %s\n", err.Error())
 		}
 	}
 
 	m := os.Getenv(repository.EnvMirrors)
 	if m != "" {
 		if cfg.Mirror != m {
-			fmt.Printf(`WARNING: both mirror config (%s)
+			fmt.Fprintf(os.Stderr, `WARNING: both mirror config (%s)
 and TIUP_MIRRORS (%s) have been set.
 Setting mirror to TIUP_MIRRORS (%s)
 `, cfg.Mirror, m, m)
@@ -77,11 +118,11 @@ type Environment struct {
 	profile *localdata.Profile
 	// repo represents the components repository of TiUP, it can be a
 	// local file system or a HTTP URL
-	v1Repo *repository.V1Repository
+	v1Repo repository.Repository
 }
 
 // InitEnv creates a new Environment object configured using env vars and defaults.
-func InitEnv(options repository.Options) (*Environment, error) {
+func InitEnv(options repository.Options, mOpt repository.MirrorOptions) (*Environment, error) {
 	if env := GlobalEnv(); env != nil {
 		return env, nil
 	}
@@ -92,7 +133,7 @@ func InitEnv(options repository.Options) (*Environment, error) {
 	// Initialize the repository
 	// Replace the mirror if some sub-commands use different mirror address
 	mirrorAddr := Mirror()
-	mirror := repository.NewMirror(mirrorAddr, repository.MirrorOptions{})
+	mirror := repository.NewMirror(mirrorAddr, mOpt)
 	if err := mirror.Open(); err != nil {
 		return nil, err
 	}
@@ -107,13 +148,13 @@ func InitEnv(options repository.Options) (*Environment, error) {
 	}
 	v1repo = repository.NewV1Repo(mirror, options, local)
 
-	verbose.Log("Initialize repository finished in %s", time.Since(initRepo))
+	zap.L().Debug("Initialize repository finished", zap.Duration("duration", time.Since(initRepo)))
 
 	return &Environment{profile, v1repo}, nil
 }
 
 // V1Repository returns the initialized v1 repository
-func (env *Environment) V1Repository() *repository.V1Repository {
+func (env *Environment) V1Repository() repository.Repository {
 	return env.v1Repo
 }
 
@@ -124,7 +165,16 @@ func (env *Environment) Profile() *localdata.Profile {
 
 // Close release resource of env.
 func (env *Environment) Close() error {
-	// no need for v1manifest
+	if env == nil {
+		return nil
+	}
+
+	if repo := env.V1Repository(); repo != nil {
+		if err := repo.Mirror().Close(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -143,20 +193,12 @@ func (env *Environment) UpdateComponents(specs []string, nightly, force bool) er
 	var v1specs []repository.ComponentSpec
 	for _, spec := range specs {
 		component, v := ParseCompVersion(spec)
-		if component == tiupName {
-			continue
-		}
 		if v == "" && nightly {
 			v = utils.NightlyVersionAlias
 		}
 		v1specs = append(v1specs, repository.ComponentSpec{ID: component, Version: v.String(), Force: force})
 	}
 	return env.v1Repo.UpdateComponents(v1specs)
-}
-
-// PlatformString returns a string identifying the current system.
-func (env *Environment) PlatformString() string {
-	return env.v1Repo.PlatformString()
 }
 
 // SelfUpdate updates TiUP.
@@ -169,31 +211,9 @@ func (env *Environment) SelfUpdate() error {
 	return localdata.InitProfile().ResetMirror(Mirror(), "")
 }
 
-func (env *Environment) downloadComponentv1(component string, version utils.Version, overwrite bool) error {
-	spec := repository.ComponentSpec{
-		ID:      component,
-		Version: string(version),
-		Force:   overwrite,
-	}
-
-	return env.v1Repo.UpdateComponents([]repository.ComponentSpec{spec})
-}
-
-// downloadComponent downloads the specific version of a component from repository
-func (env *Environment) downloadComponent(component string, version utils.Version, overwrite bool) error {
-	return env.downloadComponentv1(component, version, overwrite)
-}
-
 // SelectInstalledVersion selects the installed versions and the latest release version
 // will be chosen if there is an empty version
 func (env *Environment) SelectInstalledVersion(component string, ver utils.Version) (utils.Version, error) {
-	if ver == utils.NightlyVersionAlias {
-		var err error
-		if ver, _, err = env.v1Repo.LatestNightlyVersion(component); err != nil {
-			return ver, err
-		}
-	}
-
 	installed, err := env.Profile().InstalledVersions(component)
 	if err != nil {
 		return ver, err
@@ -201,7 +221,7 @@ func (env *Environment) SelectInstalledVersion(component string, ver utils.Versi
 
 	versions := []string{}
 	for _, v := range installed {
-		vi, err := env.v1Repo.ComponentVersion(component, v, true)
+		vi, err := env.v1Repo.LocalComponentVersion(component, v, true)
 		if errors.Cause(err) == repository.ErrUnknownVersion {
 			continue
 		}
@@ -213,81 +233,42 @@ func (env *Environment) SelectInstalledVersion(component string, ver utils.Versi
 		}
 		versions = append(versions, v)
 	}
+	// Reverse sort: v5.0.0-rc,v5.0.0-nightly-20210305,v4.0.11
+	sort.Slice(versions, func(i, j int) bool {
+		return semver.Compare(versions[i], versions[j]) > 0
+	})
 
 	errInstallFirst := errors.Annotatef(ErrInstallFirst, "use `tiup install %s` to install component `%s` first", component, component)
-	if len(installed) == 0 {
-		return ver, errInstallFirst
+	if !ver.IsEmpty() {
+		errInstallFirst = errors.Annotatef(ErrInstallFirst, "use `tiup install %s:%s` to install specified version", component, ver.String())
 	}
 
-	if !ver.IsEmpty() {
+	if ver.IsEmpty() || string(ver) == utils.NightlyVersionAlias {
+		var selected utils.Version
+		for _, v := range versions {
+			// only select nightly for nightly
+			if (string(ver) == utils.NightlyVersionAlias) != utils.Version(v).IsNightly() {
+				continue
+			}
+			if semver.Prerelease(v) == "" {
+				return utils.Version(v), nil
+			}
+			// select prerelease version when there is only prelease version on local
+			if selected.IsEmpty() {
+				selected = utils.Version(v)
+			}
+		}
+		if !selected.IsEmpty() {
+			return selected, nil
+		}
+	} else {
 		for _, v := range versions {
 			if utils.Version(v) == ver {
 				return ver, nil
 			}
 		}
-		return ver, errInstallFirst
 	}
-
-	sort.Slice(versions, func(i, j int) bool {
-		// Reverse sort: v5.0.0-rc,v5.0.0-nightly-20210305,v4.0.11
-		return semver.Compare(versions[i], versions[j]) > 0
-	})
-
-	for _, v := range versions {
-		if utils.Version(v).IsNightly() {
-			continue
-		}
-		if semver.Prerelease(v) == "" {
-			ver = utils.Version(v)
-			break
-		} else if ver.IsEmpty() {
-			ver = utils.Version(v)
-		}
-	}
-
-	if ver.IsEmpty() {
-		return ver, errInstallFirst
-	}
-	return ver, nil
-}
-
-// DownloadComponentIfMissing downloads the specific version of a component if it is missing
-func (env *Environment) DownloadComponentIfMissing(component string, ver utils.Version) (utils.Version, error) {
-	var err error
-	if ver.String() == utils.NightlyVersionAlias {
-		if ver, _, err = env.v1Repo.LatestNightlyVersion(component); err != nil {
-			return "", err
-		}
-	}
-
-	// Use the latest version if user doesn't specify a specific version and
-	// download the latest version if the specific component doesn't be installed
-
-	// Check whether the specific version exist in local
-	ver, err = env.SelectInstalledVersion(component, ver)
-	needDownload := errors.Cause(err) == ErrInstallFirst
-	if err != nil && !needDownload {
-		return "", err
-	}
-
-	if needDownload {
-		fmt.Printf("The component `%s` version %s is not installed; downloading from repository.\n", component, ver.String())
-		err := env.downloadComponent(component, ver, false)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	if ver.IsEmpty() {
-		return env.SelectInstalledVersion(component, ver)
-	}
-
-	return ver, nil
-}
-
-// GetComponentInstalledVersion return the installed version of component.
-func (env *Environment) GetComponentInstalledVersion(component string, version utils.Version) (utils.Version, error) {
-	return env.profile.GetComponentInstalledVersion(component, version)
+	return ver, errInstallFirst
 }
 
 // BinaryPath return the installed binary path.
@@ -298,6 +279,45 @@ func (env *Environment) BinaryPath(component string, ver utils.Version) (string,
 	}
 
 	return env.v1Repo.BinaryPath(installPath, component, ver.String())
+}
+
+// Link add soft link to $TIUP_HOME/bin/
+func (env *Environment) Link(component string, version utils.Version) error {
+	version, err := env.SelectInstalledVersion(component, version)
+	if err != nil {
+		return err
+	}
+	binPath, err := env.BinaryPath(component, version)
+	if err != nil {
+		return err
+	}
+
+	target := env.LocalPath("bin", filepath.Base(binPath))
+	backup := target + ".old"
+	exist := true
+	_, err = os.Stat(target)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		exist = false
+	}
+	if exist {
+		if err := os.Rename(target, backup); err != nil {
+			fmt.Printf("Backup of `%s` to `%s` failed.\n", target, backup)
+			return err
+		}
+	}
+
+	fmt.Printf("package %s provides these executables: %s\n", component, filepath.Base(binPath))
+
+	err = os.Symlink(binPath, target)
+	if err != nil {
+		defer func() { _ = os.Rename(backup, target) }()
+	} else {
+		defer func() { _ = os.Remove(backup) }()
+	}
+	return err
 }
 
 // ParseCompVersion parses component part from <component>[:version] specification

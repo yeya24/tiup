@@ -21,13 +21,15 @@ LimitCORE={{.LimitCORE}}
 LimitNOFILE=1000000
 LimitSTACK=10485760
 
-{{- if .GrantCapNetRaw}}
+{{- if and .GrantCapNetRaw (eq .SystemdMode "system")}}
 AmbientCapabilities=CAP_NET_RAW
 {{- end}}
+{{- if eq .SystemdMode "system"}}
 User={{.User}}
-ExecStart={{.DeployDir}}/scripts/run_{{.ServiceName}}.sh
+{{- end}}
+ExecStart=/bin/bash -c '{{.DeployDir}}/scripts/run_{{.ServiceName}}.sh'
 {{- if eq .ServiceName "prometheus"}}
-ExecReload=/bin/kill -HUP $MAINPID
+ExecReload=/bin/bash -c 'kill -HUP $MAINPID $(pidof {{.DeployDir}}/bin/ng-monitoring-server)'
 {{end}}
 
 {{- if .Restart}}
@@ -38,6 +40,12 @@ Restart=always
 RestartSec=15s
 {{- if .DisableSendSigkill}}
 SendSIGKILL=no
+{{- end}}
+{{- if .TimeoutStartSec}}
+TimeoutStartSec={{.TimeoutStartSec}}
+{{- end}}
+{{- if .TimeoutStopSec}}
+TimeoutStopSec={{.TimeoutStopSec}}
 {{- end}}
 
 [Install]

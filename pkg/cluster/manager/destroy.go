@@ -17,17 +17,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/joomcode/errorx"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cliutil"
+	"github.com/pingcap/tiup/pkg/cluster/api"
 	"github.com/pingcap/tiup/pkg/cluster/clusterutil"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/tui"
 )
 
 // DestroyCluster destroy the cluster.
@@ -53,26 +54,45 @@ func (m *Manager) DestroyCluster(name string, gOpt operator.Options, destroyOpt 
 	}
 
 	if !skipConfirm {
-		if err := cliutil.PromptForConfirmOrAbortError(
-			"This operation will destroy %s %s cluster %s and its data.\nDo you want to continue? [y/N]:",
-			m.sysName,
-			color.HiYellowString(base.Version),
-			color.HiYellowString(name)); err != nil {
+		m.logger.Warnf("%s", color.HiRedString(tui.ASCIIArtWarning))
+		if err := tui.PromptForAnswerOrAbortError(
+			"Yes, I know my cluster and data will be deleted.",
+			"%s", fmt.Sprintf("This operation will destroy %s %s cluster %s and its data.",
+				m.sysName,
+				color.HiYellowString(base.Version),
+				color.HiYellowString(name),
+			)+"\nAre you sure to continue?",
+		); err != nil {
 			return err
 		}
-		log.Infof("Destroying cluster...")
+		m.logger.Infof("Destroying cluster...")
 	}
 
-	t := m.sshTaskBuilder(name, topo, base.User, gOpt).
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
+	t := b.
 		Func("StopCluster", func(ctx context.Context) error {
-			return operator.Stop(ctx, topo, operator.Options{Force: destroyOpt.Force}, tlsCfg)
+			return operator.Stop(
+				ctx,
+				topo,
+				operator.Options{Force: destroyOpt.Force},
+				false, /* eviceLeader */
+				tlsCfg,
+			)
 		}).
 		Func("DestroyCluster", func(ctx context.Context) error {
 			return operator.Destroy(ctx, topo, destroyOpt)
 		}).
 		Build()
 
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
+	if err := t.Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -84,7 +104,7 @@ func (m *Manager) DestroyCluster(name string, gOpt operator.Options, destroyOpt 
 		return perrs.Trace(err)
 	}
 
-	log.Infof("Destroyed cluster `%s` successfully", name)
+	m.logger.Infof("Destroyed cluster `%s` successfully", name)
 	return nil
 }
 
@@ -117,33 +137,38 @@ func (m *Manager) DestroyTombstone(
 		return err
 	}
 
-	b := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
 
-	ctx := ctxt.New(context.Background())
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
 	nodes, err := operator.DestroyTombstone(ctx, cluster, true /* returnNodesOnly */, gOpt, tlsCfg)
 	if err != nil {
 		return err
 	}
-	regenConfigTasks, _ := buildRegenConfigTasks(m, name, topo, base, nodes, true)
 
 	t := b.
 		Func("FindTomestoneNodes", func(ctx context.Context) (err error) {
 			if !skipConfirm {
-				err = cliutil.PromptForConfirmOrAbortError(
-					color.HiYellowString(fmt.Sprintf("Will destroy these nodes: %v\nDo you confirm this action? [y/N]:", nodes)),
+				err = tui.PromptForConfirmOrAbortError(
+					"%s", fmt.Sprintf("%s\nDo you confirm this action? [y/N]:",
+						color.HiYellowString("Will destroy these nodes: %v", nodes)),
 				)
 				if err != nil {
 					return err
 				}
 			}
-			log.Infof("Start destroy Tombstone nodes: %v ...", nodes)
+			m.logger.Infof("Start destroy Tombstone nodes: %v ...", nodes)
 			return err
 		}).
 		ClusterOperate(cluster, operator.DestroyTombstoneOperation, gOpt, tlsCfg).
 		UpdateMeta(name, clusterMeta, nodes).
 		UpdateTopology(name, m.specManager.Path(name), clusterMeta, nodes).
-		ParallelStep("+ Refresh instance configs", true, regenConfigTasks...).
-		Parallel(true, buildReloadPromTasks(metadata.GetTopology())...).
 		Build()
 
 	if err := t.Execute(ctx); err != nil {
@@ -154,7 +179,47 @@ func (m *Manager) DestroyTombstone(
 		return perrs.Trace(err)
 	}
 
-	log.Infof("Destroy success")
+	// Destroy ignore error and force exec
+	gOpt.IgnoreConfigCheck = true
+	gOpt.Force = true
+	// get new metadata
+	metadata, err = m.meta(name)
+	if err != nil &&
+		!errors.Is(perrs.Cause(err), spec.ErrNoTiSparkMaster) {
+		return err
+	}
+	topo = metadata.GetTopology()
+	base = metadata.GetBaseMeta()
+
+	b, err = m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
+	}
+
+	regenConfigTasks := buildInitConfigTasks(m, name, topo, base, gOpt, nodes)
+	t = b.
+		ParallelStep("+ Refresh instance configs", gOpt.Force, regenConfigTasks...).
+		ParallelStep("+ Reload prometheus and grafana", gOpt.Force,
+			buildReloadPromAndGrafanaTasks(topo, m.logger, gOpt)...).
+		Func("RemoveTomestoneNodesInPD", func(ctx context.Context) (err error) {
+			pdEndpoints := make([]string, 0)
+			for _, pd := range cluster.PDServers {
+				pdEndpoints = append(pdEndpoints, fmt.Sprintf("%s:%d", pd.Host, pd.ClientPort))
+			}
+			pdAPI := api.NewPDClient(ctx, pdEndpoints, time.Second*time.Duration(gOpt.APITimeout), tlsCfg)
+			return pdAPI.RemoveTombstone()
+		}).
+		Build()
+
+	if err := t.Execute(ctx); err != nil {
+		if errorx.Cast(err) != nil {
+			// FIXME: Map possible task errors and give suggestions.
+			return err
+		}
+		return perrs.Trace(err)
+	}
+
+	m.logger.Infof("Destroy success")
 
 	return nil
 }

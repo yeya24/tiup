@@ -18,15 +18,14 @@ import (
 	"path"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cliutil"
-	"github.com/pingcap/tiup/pkg/cluster/executor"
 	"github.com/pingcap/tiup/pkg/cluster/manager"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
+	"github.com/pingcap/tiup/pkg/tidbver"
+	"github.com/pingcap/tiup/pkg/tui"
 	"github.com/pingcap/tiup/pkg/utils"
 	"github.com/spf13/cobra"
-	"golang.org/x/mod/semver"
 )
 
 func newDeployCmd() *cobra.Command {
@@ -39,17 +38,12 @@ func newDeployCmd() *cobra.Command {
 		Long:         "Deploy a DM cluster for production. SSH connection will be used to deploy files, as well as creating system users for running the service.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			shouldContinue, err := cliutil.CheckCommandArgsAndMayPrintHelp(cmd, args, 3)
+			shouldContinue, err := tui.CheckCommandArgsAndMayPrintHelp(cmd, args, 3)
 			if err != nil {
 				return err
 			}
 			if !shouldContinue {
 				return nil
-			}
-
-			// natvie ssh has it's own logic to find the default identity_file
-			if gOpt.SSHType == executor.SSHTypeSystem && !utils.IsFlagSetByUser(cmd.Flags(), "identity_file") {
-				opt.IdentityFile = ""
 			}
 
 			clusterName := args[0]
@@ -65,6 +59,14 @@ func newDeployCmd() *cobra.Command {
 
 			return cm.Deploy(clusterName, version, topoFile, opt, postDeployHook, skipConfirm, gOpt)
 		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			switch len(args) {
+			case 2:
+				return nil, cobra.ShellCompDirectiveDefault
+			default:
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+		},
 	}
 
 	cmd.Flags().StringVarP(&opt.User, "user", "u", utils.CurrentUser(), "The user name to login via SSH. The user must has root (or sudo) privilege.")
@@ -75,20 +77,15 @@ func newDeployCmd() *cobra.Command {
 }
 
 func supportVersion(vs string) error {
-	if !semver.IsValid(vs) {
-		return nil
-	}
-
-	majorMinor := semver.MajorMinor(vs)
-	if semver.Compare(majorMinor, "v2.0") < 0 {
+	if !tidbver.DMSupportDeploy(vs) {
 		return errors.Errorf("Only support version not less than v2.0")
 	}
 
 	return nil
 }
 
-func postDeployHook(builder *task.Builder, topo spec.Topology) {
-	enableTask := task.NewBuilder().Func("Setting service auto start on boot", func(ctx context.Context) error {
+func postDeployHook(builder *task.Builder, topo spec.Topology, gOpt operator.Options) {
+	enableTask := task.NewBuilder(builder.Logger).Func("Setting service auto start on boot", func(ctx context.Context) error {
 		return operator.Enable(ctx, topo, operator.Options{}, true)
 	}).BuildAsStep("Enable service").SetHidden(true)
 

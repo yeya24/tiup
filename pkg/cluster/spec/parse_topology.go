@@ -14,25 +14,26 @@
 package spec
 
 import (
+	"bytes"
 	"os"
 	"path"
 	"reflect"
 	"strings"
 
 	"github.com/joomcode/errorx"
-	"github.com/pingcap/tiup/pkg/cliutil"
-	"github.com/pingcap/tiup/pkg/errutil"
+	"github.com/pingcap/tiup/pkg/tui"
+	"github.com/pingcap/tiup/pkg/utils"
 	"go.uber.org/zap"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 var (
 	defaultDeployUser = "tidb"
 	errNSTopolohy     = errorx.NewNamespace("topology")
 	// ErrTopologyReadFailed is ErrTopologyReadFailed
-	ErrTopologyReadFailed = errNSTopolohy.NewType("read_failed", errutil.ErrTraitPreCheck)
+	ErrTopologyReadFailed = errNSTopolohy.NewType("read_failed", utils.ErrTraitPreCheck)
 	// ErrTopologyParseFailed is ErrTopologyParseFailed
-	ErrTopologyParseFailed = errNSTopolohy.NewType("parse_failed", errutil.ErrTraitPreCheck)
+	ErrTopologyParseFailed = errNSTopolohy.NewType("parse_failed", utils.ErrTraitPreCheck)
 )
 
 // ReadYamlFile read yaml content from file`
@@ -45,7 +46,7 @@ func ReadYamlFile(file string) ([]byte, error) {
 	if err != nil {
 		return nil, ErrTopologyReadFailed.
 			Wrap(err, "Failed to read topology file %s", file).
-			WithProperty(cliutil.SuggestionFromTemplate(`
+			WithProperty(tui.SuggestionFromTemplate(`
 Please check whether your topology file {{ColorKeyword}}{{.File}}{{ColorReset}} exists and try again.
 
 To generate a sample topology file:
@@ -56,7 +57,8 @@ To generate a sample topology file:
 }
 
 // ParseTopologyYaml read yaml content from `file` and unmarshal it to `out`
-func ParseTopologyYaml(file string, out Topology) error {
+// ignoreGlobal ignore global variables in file, only ignoreGlobal with a index of 0 is effective
+func ParseTopologyYaml(file string, out Topology, ignoreGlobal ...bool) error {
 	suggestionProps := map[string]string{
 		"File": file,
 	}
@@ -68,10 +70,29 @@ func ParseTopologyYaml(file string, out Topology) error {
 		return err
 	}
 
-	if err = yaml.UnmarshalStrict(yamlFile, out); err != nil {
+	// keep the global config in out
+	if len(ignoreGlobal) > 0 && ignoreGlobal[0] {
+		var newTopo map[string]any
+		if err := yaml.Unmarshal(yamlFile, &newTopo); err != nil {
+			return err
+		}
+		for k := range newTopo {
+			switch k {
+			case "global",
+				"monitored",
+				"server_configs":
+				delete(newTopo, k)
+			}
+		}
+		yamlFile, _ = yaml.Marshal(newTopo)
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(yamlFile))
+	decoder.KnownFields(true)
+	if err = decoder.Decode(out); err != nil {
 		return ErrTopologyParseFailed.
 			Wrap(err, "Failed to parse topology file %s", file).
-			WithProperty(cliutil.SuggestionFromTemplate(`
+			WithProperty(tui.SuggestionFromTemplate(`
 Please check the syntax of your topology file {{ColorKeyword}}{{.File}}{{ColorReset}} and try again.
 `, suggestionProps))
 	}
@@ -86,7 +107,7 @@ func ExpandRelativeDir(topo Topology) {
 	expandRelativePath(deployUser(topo), topo)
 }
 
-func expandRelativePath(user string, topo interface{}) {
+func expandRelativePath(user string, topo any) {
 	v := reflect.Indirect(reflect.ValueOf(topo).Elem())
 
 	switch v.Kind() {
@@ -137,7 +158,7 @@ func expandRelativePath(user string, topo interface{}) {
 			expandRelativePath(user, ref.Interface())
 			v.Field(i).Set(ref.Elem())
 		}
-	case reflect.Ptr:
+	case reflect.Pointer:
 		expandRelativePath(user, v.Interface())
 	}
 }

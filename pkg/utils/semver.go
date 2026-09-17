@@ -21,11 +21,16 @@ import (
 
 	"golang.org/x/mod/semver"
 
+	"slices"
+
 	"github.com/pingcap/errors"
 )
 
 // NightlyVersionAlias represents latest build of master branch.
 const NightlyVersionAlias = "nightly"
+
+// NextgenVersionAlias represents latest build of nextgen branch.
+const NextgenVersionAlias = "nextgen"
 
 // LatestVersionAlias represents the latest build (excluding nightly versions).
 const LatestVersionAlias = "latest"
@@ -154,7 +159,7 @@ func NewConstraint(raw string) (*Constraint, error) {
 		c.min.Prerelease = []string{}
 	}
 
-	c.max.Prerelease = append([]string(nil), c.min.Prerelease...)
+	c.max.Prerelease = slices.Clone(c.min.Prerelease)
 
 	if constraint := result["constraint"]; constraint == "~" {
 		// ~x.y.z -> >=x.y.z <x.(y+1).0

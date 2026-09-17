@@ -16,74 +16,92 @@ package instance
 import (
 	"context"
 	"fmt"
-	"os"
-	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/pingcap/errors"
+	"github.com/pingcap/tiup/pkg/cluster/api"
 	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // TiKVInstance represent a running tikv-server
 type TiKVInstance struct {
 	instance
-	pds []*PDInstance
-	Process
+	shOpt SharedOptions
+	pds   []*PDInstance
+	tsos  []*PDInstance
 }
 
+var _ Instance = &TiKVInstance{}
+
 // NewTiKVInstance return a TiKVInstance
-func NewTiKVInstance(binPath string, dir, host, configPath string, id int, pds []*PDInstance) *TiKVInstance {
+func NewTiKVInstance(shOpt SharedOptions, binPath string, dir, host, configPath string, id int, port int, pds []*PDInstance, tsos []*PDInstance) *TiKVInstance {
+	if port <= 0 {
+		port = 20160
+	}
 	return &TiKVInstance{
+		shOpt: shOpt,
 		instance: instance{
 			BinPath:    binPath,
 			ID:         id,
 			Dir:        dir,
 			Host:       host,
-			Port:       utils.MustGetFreePort(host, 20160),
-			StatusPort: utils.MustGetFreePort(host, 20180),
+			Port:       utils.MustGetFreePort(host, port, shOpt.PortOffset),
+			StatusPort: utils.MustGetFreePort(host, 20180, shOpt.PortOffset),
 			ConfigPath: configPath,
+			role:       "tikv",
 		},
-		pds: pds,
+		pds:  pds,
+		tsos: tsos,
 	}
 }
 
 // Addr return the address of tikv.
 func (inst *TiKVInstance) Addr() string {
-	return fmt.Sprintf("%s:%d", inst.Host, inst.Port)
+	return utils.JoinHostPort(inst.Host, inst.Port)
 }
 
 // Start calls set inst.cmd and Start
-func (inst *TiKVInstance) Start(ctx context.Context, version utils.Version) error {
-	if err := inst.checkConfig(); err != nil {
+func (inst *TiKVInstance) Start(ctx context.Context) error {
+	configPath := filepath.Join(inst.Dir, "tikv.toml")
+	if err := prepareConfig(
+		configPath,
+		inst.ConfigPath,
+		inst.getConfig(),
+	); err != nil {
 		return err
+	}
+
+	// Need to check tso status
+	if inst.shOpt.PDMode == "ms" {
+		var tsoEnds []string
+		for _, pd := range inst.tsos {
+			tsoEnds = append(tsoEnds, fmt.Sprintf("%s:%d", AdvertiseHost(pd.Host), pd.StatusPort))
+		}
+		pdcli := api.NewPDClient(ctx,
+			tsoEnds, 10*time.Second, nil,
+		)
+		if err := pdcli.CheckTSOHealth(&utils.RetryOption{
+			Delay:   time.Second * 5,
+			Timeout: time.Second * 300,
+		}); err != nil {
+			return err
+		}
 	}
 
 	endpoints := pdEndpoints(inst.pds, true)
 	args := []string{
-		fmt.Sprintf("--addr=%s:%d", inst.Host, inst.Port),
-		fmt.Sprintf("--advertise-addr=%s:%d", AdvertiseHost(inst.Host), inst.Port),
-		fmt.Sprintf("--status-addr=%s:%d", inst.Host, inst.StatusPort),
-		fmt.Sprintf("--pd=%s", strings.Join(endpoints, ",")),
-		fmt.Sprintf("--config=%s", inst.ConfigPath),
+		fmt.Sprintf("--addr=%s", utils.JoinHostPort(inst.Host, inst.Port)),
+		fmt.Sprintf("--advertise-addr=%s", utils.JoinHostPort(AdvertiseHost(inst.Host), inst.Port)),
+		fmt.Sprintf("--status-addr=%s", utils.JoinHostPort(inst.Host, inst.StatusPort)),
+		fmt.Sprintf("--pd-endpoints=%s", strings.Join(endpoints, ",")),
+		fmt.Sprintf("--config=%s", configPath),
 		fmt.Sprintf("--data-dir=%s", filepath.Join(inst.Dir, "data")),
 		fmt.Sprintf("--log-file=%s", inst.LogFile()),
 	}
 
-	var err error
-	envs := make(map[string]string)
-	envs["MALLOC_CONF"] = "prof:true,prof_active:true,prof.active:false"
-	if inst.Process, err = NewComponentProcessWithEnvs(ctx, inst.Dir, inst.BinPath, "tikv", version, envs, args...); err != nil {
-		return err
-	}
-	logIfErr(inst.Process.SetOutputFile(inst.LogFile()))
-
-	return inst.Process.Start()
-}
-
-// Component return the component name.
-func (inst *TiKVInstance) Component() string {
-	return "tikv"
+	envs := []string{"MALLOC_CONF=prof:true,prof_active:false"}
+	return inst.PrepareProcess(ctx, inst.BinPath, args, envs, inst.Dir)
 }
 
 // LogFile return the log file name.
@@ -93,34 +111,5 @@ func (inst *TiKVInstance) LogFile() string {
 
 // StoreAddr return the store address of TiKV
 func (inst *TiKVInstance) StoreAddr() string {
-	return fmt.Sprintf("%s:%d", AdvertiseHost(inst.Host), inst.Port)
-}
-
-func (inst *TiKVInstance) checkConfig() error {
-	if err := os.MkdirAll(inst.Dir, 0755); err != nil {
-		return err
-	}
-	if inst.ConfigPath == "" {
-		inst.ConfigPath = path.Join(inst.Dir, "tikv.toml")
-	}
-
-	_, err := os.Stat(inst.ConfigPath)
-	if err == nil || os.IsExist(err) {
-		return nil
-	}
-	if !os.IsNotExist(err) {
-		return errors.Trace(err)
-	}
-
-	cf, err := os.Create(inst.ConfigPath)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	defer cf.Close()
-	if err := writeTiKVConfig(cf); err != nil {
-		return errors.Trace(err)
-	}
-
-	return nil
+	return utils.JoinHostPort(AdvertiseHost(inst.Host), inst.Port)
 }

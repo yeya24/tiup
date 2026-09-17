@@ -14,44 +14,50 @@
 package manager
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/fatih/color"
 	"github.com/joomcode/errorx"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cliutil"
+	"github.com/pingcap/tiup/pkg/cluster/ctxt"
+	"github.com/pingcap/tiup/pkg/cluster/executor"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
-	"github.com/pingcap/tiup/pkg/errutil"
-	"github.com/pingcap/tiup/pkg/logger/log"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/tui"
 	"github.com/pingcap/tiup/pkg/utils"
 )
 
 var (
 	errNSDeploy            = errorx.NewNamespace("deploy")
-	errDeployNameDuplicate = errNSDeploy.NewType("name_dup", errutil.ErrTraitPreCheck)
+	errDeployNameDuplicate = errNSDeploy.NewType("name_dup", utils.ErrTraitPreCheck)
 
 	errNSRename              = errorx.NewNamespace("rename")
-	errorRenameNameNotExist  = errNSRename.NewType("name_not_exist", errutil.ErrTraitPreCheck)
-	errorRenameNameDuplicate = errNSRename.NewType("name_dup", errutil.ErrTraitPreCheck)
+	errorRenameNameNotExist  = errNSRename.NewType("name_not_exist", utils.ErrTraitPreCheck)
+	errorRenameNameDuplicate = errNSRename.NewType("name_dup", utils.ErrTraitPreCheck)
 )
 
 // Manager to deploy a cluster.
 type Manager struct {
 	sysName     string
 	specManager *spec.SpecManager
-	bindVersion spec.BindVersion
+	logger      *logprinter.Logger
 }
 
 // NewManager create a Manager.
-func NewManager(sysName string, specManager *spec.SpecManager, bindVersion spec.BindVersion) *Manager {
+func NewManager(
+	sysName string,
+	specManager *spec.SpecManager,
+	logger *logprinter.Logger,
+) *Manager {
 	return &Manager{
 		sysName:     sysName,
 		specManager: specManager,
-		bindVersion: bindVersion,
+		logger:      logger,
 	}
 }
 
@@ -75,7 +81,7 @@ func (m *Manager) meta(name string) (metadata spec.Metadata, err error) {
 }
 
 func (m *Manager) confirmTopology(name, version string, topo spec.Topology, patchedRoles set.StringSet) error {
-	log.Infof("Please confirm your topology:")
+	m.logger.Infof("Please confirm your topology:")
 
 	cyan := color.New(color.FgCyan, color.Bold)
 	fmt.Printf("Cluster type:    %s\n", cyan.Sprint(m.sysName))
@@ -85,32 +91,48 @@ func (m *Manager) confirmTopology(name, version string, topo spec.Topology, patc
 		fmt.Printf("TLS encryption:  %s\n", cyan.Sprint("enabled"))
 	}
 
+	// check if managehost is set
+	manageHost := false
+	topo.IterInstance(func(inst spec.Instance) {
+		if inst.GetHost() != inst.GetManageHost() {
+			manageHost = true
+			return
+		}
+	})
+
 	clusterTable := [][]string{
 		// Header
-		{"Role", "Host", "Ports", "OS/Arch", "Directories"},
+		{"Role", "Host"},
 	}
+	if manageHost {
+		clusterTable[0] = append(clusterTable[0], "Manage Host")
+	}
+	clusterTable[0] = append(clusterTable[0], "Ports", "OS/Arch", "Directories")
 
 	topo.IterInstance(func(instance spec.Instance) {
 		comp := instance.ComponentName()
 		if patchedRoles.Exist(comp) || instance.IsPatched() {
 			comp += " (patched)"
 		}
-		clusterTable = append(clusterTable, []string{
-			comp,
-			instance.GetHost(),
+		instInfo := []string{comp, instance.GetHost()}
+		if manageHost {
+			instInfo = append(instInfo, instance.GetManageHost())
+		}
+		instInfo = append(instInfo,
 			utils.JoinInt(instance.UsedPorts(), "/"),
-			cliutil.OsArch(instance.OS(), instance.Arch()),
-			strings.Join(instance.UsedDirs(), ","),
-		})
+			tui.OsArch(instance.OS(), instance.Arch()),
+			strings.Join(instance.UsedDirs(), ","))
+
+		clusterTable = append(clusterTable, instInfo)
 	})
 
-	cliutil.PrintTable(clusterTable, true)
+	tui.PrintTable(clusterTable, true)
 
-	log.Warnf("Attention:")
-	log.Warnf("    1. If the topology is not what you expected, check your yaml file.")
-	log.Warnf("    2. Please confirm there is no port/directory conflicts in same host.")
+	m.logger.Warnf("Attention:")
+	m.logger.Warnf("    1. If the topology is not what you expected, check your yaml file.")
+	m.logger.Warnf("    2. Please confirm there is no port/directory conflicts in same host.")
 	if len(patchedRoles) != 0 {
-		log.Errorf("    3. The component marked as `patched` has been replaced by previous patch commanm.")
+		m.logger.Errorf("    3. The component marked as `patched` has been replaced by previous patch commanm.")
 	}
 
 	if spec, ok := topo.(*spec.Specification); ok {
@@ -119,18 +141,126 @@ func (m *Manager) confirmTopology(name, version string, topo spec.Topology, patc
 			msg := cyan.Sprint(`There are TiSpark nodes defined in the topology, please note that you'll need to manually install Java Runtime Environment (JRE) 8 on the host, otherwise the TiSpark nodes will fail to start.
 You may read the OpenJDK doc for a reference: https://openjdk.java.net/install/
 			`)
-			log.Warnf(msg)
+			m.logger.Warnf("%s", msg)
 		}
 	}
 
-	return cliutil.PromptForConfirmOrAbortError("Do you want to continue? [y/N]: ")
+	return tui.PromptForConfirmOrAbortError("Do you want to continue? [y/N]: ")
 }
 
-func (m *Manager) sshTaskBuilder(name string, topo spec.Topology, user string, opts operator.Options) *task.Builder {
-	return task.NewBuilder().
+func (m *Manager) sshTaskBuilder(name string, topo spec.Topology, user string, gOpt operator.Options) (*task.Builder, error) {
+	var p = &tui.SSHConnectionProps{}
+	if gOpt.SSHType != executor.SSHTypeNone && len(gOpt.SSHProxyHost) != 0 {
+		var err error
+		if p, err = tui.ReadIdentityFileOrPassword(gOpt.SSHProxyIdentity, gOpt.SSHProxyUsePassword); err != nil {
+			return nil, err
+		}
+	}
+
+	return task.NewBuilder(m.logger).
 		SSHKeySet(
 			m.specManager.Path(name, "ssh", "id_rsa"),
 			m.specManager.Path(name, "ssh", "id_rsa.pub"),
 		).
-		ClusterSSH(topo, user, opts.SSHTimeout, opts.SSHType, topo.BaseTopo().GlobalOptions.SSHType)
+		ClusterSSH(
+			topo,
+			user,
+			gOpt.SSHTimeout,
+			gOpt.OptTimeout,
+			gOpt.SSHProxyHost,
+			gOpt.SSHProxyPort,
+			gOpt.SSHProxyUser,
+			p.Password,
+			p.IdentityFile,
+			p.IdentityFilePassphrase,
+			gOpt.SSHProxyTimeout,
+			gOpt.SSHType,
+			topo.BaseTopo().GlobalOptions.SSHType,
+		), nil
+}
+
+// fillHost full host cpu-arch and kernel-name
+func (m *Manager) fillHost(s, p *tui.SSHConnectionProps, topo spec.Topology, gOpt *operator.Options, user string, sudo bool) error {
+	if err := m.fillHostArchOrOS(s, p, topo, gOpt, user, spec.FullArchType, sudo); err != nil {
+		return err
+	}
+
+	return m.fillHostArchOrOS(s, p, topo, gOpt, user, spec.FullOSType, sudo)
+}
+
+// fillHostArchOrOS full host cpu-arch or kernel-name
+func (m *Manager) fillHostArchOrOS(s, p *tui.SSHConnectionProps, topo spec.Topology, gOpt *operator.Options, user string, fullType spec.FullHostType, sudo bool) error {
+	globalSSHType := topo.BaseTopo().GlobalOptions.SSHType
+	hostArchOrOS := map[string]string{}
+	var detectTasks []*task.StepDisplay
+
+	topo.IterInstance(func(inst spec.Instance) {
+		if fullType == spec.FullOSType {
+			if inst.OS() != "" {
+				return
+			}
+		} else if inst.Arch() != "" {
+			return
+		}
+
+		if _, ok := hostArchOrOS[inst.GetManageHost()]; ok {
+			return
+		}
+		hostArchOrOS[inst.GetManageHost()] = ""
+
+		tf := task.NewBuilder(m.logger).
+			RootSSH(
+				inst.GetManageHost(),
+				inst.GetSSHPort(),
+				user,
+				s.Password,
+				s.IdentityFile,
+				s.IdentityFilePassphrase,
+				gOpt.SSHTimeout,
+				gOpt.OptTimeout,
+				gOpt.SSHProxyHost,
+				gOpt.SSHProxyPort,
+				gOpt.SSHProxyUser,
+				p.Password,
+				p.IdentityFile,
+				p.IdentityFilePassphrase,
+				gOpt.SSHProxyTimeout,
+				gOpt.SSHType,
+				globalSSHType,
+				sudo,
+			)
+
+		switch fullType {
+		case spec.FullOSType:
+			tf = tf.Shell(inst.GetManageHost(), "uname -s", "", false)
+		default:
+			tf = tf.Shell(inst.GetManageHost(), "uname -m", "", false)
+		}
+		detectTasks = append(detectTasks, tf.BuildAsStep(fmt.Sprintf("  - Detecting node %s %s info", inst.GetManageHost(), string(fullType))))
+	})
+	if len(detectTasks) == 0 {
+		return nil
+	}
+
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
+	t := task.NewBuilder(m.logger).
+		ParallelStep(fmt.Sprintf("+ Detect CPU %s Name", string(fullType)), false, detectTasks...).
+		Build()
+
+	if err := t.Execute(ctx); err != nil {
+		return perrs.Annotate(err, "failed to fetch cpu-arch or kernel-name")
+	}
+
+	for host := range hostArchOrOS {
+		stdout, _, ok := ctxt.GetInner(ctx).GetOutputs(host)
+		if !ok {
+			return fmt.Errorf("no check results found for %s", host)
+		}
+		hostArchOrOS[host] = strings.Trim(string(stdout), "\n")
+	}
+	return topo.FillHostArchOrOS(hostArchOrOS, fullType)
 }

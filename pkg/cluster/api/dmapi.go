@@ -15,6 +15,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"strings"
@@ -45,10 +46,7 @@ type DMMasterClient struct {
 
 // NewDMMasterClient returns a new PDClient
 func NewDMMasterClient(addrs []string, timeout time.Duration, tlsConfig *tls.Config) *DMMasterClient {
-	enableTLS := false
-	if tlsConfig != nil {
-		enableTLS = true
-	}
+	enableTLS := tlsConfig != nil
 
 	return &DMMasterClient{
 		addrs:      addrs,
@@ -78,7 +76,7 @@ func (dm *DMMasterClient) getEndpoints(cmd string) (endpoints []string) {
 func (dm *DMMasterClient) getMember(endpoints []string) (*dmpb.ListMemberResponse, error) {
 	resp := &dmpb.ListMemberResponse{}
 	_, err := tryURLs(endpoints, func(endpoint string) ([]byte, error) {
-		body, err := dm.httpClient.Get(endpoint)
+		body, err := dm.httpClient.Get(context.TODO(), endpoint)
 		if err != nil {
 			return body, err
 		}
@@ -101,7 +99,7 @@ func (dm *DMMasterClient) getMember(endpoints []string) (*dmpb.ListMemberRespons
 func (dm *DMMasterClient) deleteMember(endpoints []string) (*dmpb.OfflineMemberResponse, error) {
 	resp := &dmpb.OfflineMemberResponse{}
 	_, err := tryURLs(endpoints, func(endpoint string) ([]byte, error) {
-		body, statusCode, err := dm.httpClient.Delete(endpoint, nil)
+		body, statusCode, err := dm.httpClient.Delete(context.TODO(), endpoint, nil)
 
 		if statusCode == 404 || bytes.Contains(body, []byte("not exists")) {
 			zap.L().Debug("member to offline does not exist, ignore.")
@@ -263,7 +261,7 @@ func (dm *DMMasterClient) OfflineMember(query string, retryOpt *utils.RetryOptio
 		_, err := dm.deleteMember(endpoints)
 		return err
 	}, *retryOpt); err != nil {
-		return fmt.Errorf("error offline member %s, %v", query, err)
+		return fmt.Errorf("error offline member %s, %v, %s", query, err, endpoints[0])
 	}
 	return nil
 }

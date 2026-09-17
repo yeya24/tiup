@@ -114,7 +114,7 @@ server_from_sub_path = true
 ;reporting_enabled = true
 
 # Set to false to disable all checks to https://grafana.net
-# for new vesions (grafana itself and plugins), check is used
+# for new versions (grafana itself and plugins), check is used
 # in some UI views to notify that grafana or plugin update exists
 # This option does not cause any auto updates, nor send any information
 # only a GET request to http://grafana.net to get latest versions
@@ -129,7 +129,7 @@ check_for_updates = true
 admin_user = {{.Username}}
 
 # default admin password, can be changed before first start of grafana,  or in profile settings
-admin_password = {{.Password}}
+admin_password = `{{.Password}}`
 
 # used for signing
 ;secret_key = SW2YcwTIb9zpOOhoPsMm
@@ -169,7 +169,15 @@ admin_password = {{.Password}}
 ;login_hint = email or username
 
 # Default UI theme ("dark" or "light")
+{{- if .DefaultTheme}}
+default_theme = {{.DefaultTheme}}
+{{- else}}
 ;default_theme = dark
+{{- end}}
+
+############### Set Cookie Name for Multiple Instances #######################
+[auth]
+login_cookie_name = grafana_session_{{ if .Domain }}{{.Domain}}_{{ end }}{{.Port}}
 
 #################################### Anonymous Auth ##########################
 [auth.anonymous]
@@ -178,10 +186,18 @@ enabled = true
 {{- end}}
 
 # specify organization name that should be used for unauthenticated users
+{{- if .OrgName}}
+org_name = {{.OrgName}}
+{{- else}}
 ;org_name = Main Org.
+{{- end}}
 
 # specify role for unauthenticated users
+{{- if .OrgRole}}
+org_role = {{.OrgRole}}
+{{- else}}
 ;org_role = Viewer
+{{- end}}
 
 #################################### Basic Auth ##########################
 [auth.basic]

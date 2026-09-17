@@ -21,11 +21,12 @@ import (
 	"testing"
 
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
 	"github.com/stretchr/testify/require"
 )
 
 func TestLocal(t *testing.T) {
-	ctx := ctxt.New(context.Background())
+	ctx := ctxt.New(context.Background(), 0, logprinter.NewLogger(""))
 
 	assert := require.New(t)
 	user, err := user.Current()
@@ -54,7 +55,7 @@ func TestLocal(t *testing.T) {
 	defer os.Remove(dst.Name())
 
 	// Transfer src to dst and check it.
-	err = local.Transfer(ctx, src.Name(), dst.Name(), false)
+	err = local.Transfer(ctx, src.Name(), dst.Name(), false, 0, false)
 	assert.Nil(err)
 
 	data, err := os.ReadFile(dst.Name())
@@ -72,7 +73,7 @@ func TestWrongIP(t *testing.T) {
 }
 
 func TestLocalExecuteWithQuotes(t *testing.T) {
-	ctx := ctxt.New(context.Background())
+	ctx := ctxt.New(context.Background(), 0, logprinter.NewLogger(""))
 
 	assert := require.New(t)
 	user, err := user.Current()
@@ -85,8 +86,8 @@ func TestLocalExecuteWithQuotes(t *testing.T) {
 	defer os.RemoveAll(deployDir)
 
 	cmds := []string{
-		fmt.Sprintf(`find %s -type f -exec sed -i "s/\${DS_.*-CLUSTER}/hello/g" {} \;`, deployDir),
-		fmt.Sprintf(`find %s -type f -exec sed -i "s/DS_.*-CLUSTER/hello/g" {} \;`, deployDir),
+		fmt.Sprintf(`find %s -type f -exec sed -i 's/\${DS_.*-CLUSTER}/hello/g' {} \;`, deployDir),
+		fmt.Sprintf(`find %s -type f -exec sed -i 's/DS_.*-CLUSTER/hello/g' {} \;`, deployDir),
 		`ls '/tmp'`,
 	}
 	for _, cmd := range cmds {

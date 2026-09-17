@@ -14,6 +14,7 @@
 package spec
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/meta"
 	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 const (
@@ -34,9 +36,10 @@ const (
 )
 
 var (
-	globalOptionTypeName  = reflect.TypeOf(GlobalOptions{}).Name()
-	monitorOptionTypeName = reflect.TypeOf(MonitoredOptions{}).Name()
-	serverConfigsTypeName = reflect.TypeOf(DMServerConfigs{}).Name()
+	globalOptionTypeName     = reflect.TypeFor[GlobalOptions]().Name()
+	monitorOptionTypeName    = reflect.TypeFor[MonitoredOptions]().Name()
+	serverConfigsTypeName    = reflect.TypeFor[DMServerConfigs]().Name()
+	componentSourcesTypeName = reflect.TypeFor[ComponentSources]().Name()
 )
 
 func setDefaultDir(parent, role, port string, field reflect.Value) {
@@ -60,14 +63,14 @@ func findField(v reflect.Value, fieldName string) (int, bool) {
 
 // Skip global/monitored/job options
 func isSkipField(field reflect.Value) bool {
-	if field.Kind() == reflect.Ptr {
+	if field.Kind() == reflect.Pointer {
 		if field.IsZero() {
 			return true
 		}
 		field = field.Elem()
 	}
 	tp := field.Type().Name()
-	return tp == globalOptionTypeName || tp == monitorOptionTypeName || tp == serverConfigsTypeName
+	return tp == globalOptionTypeName || tp == monitorOptionTypeName || tp == serverConfigsTypeName || tp == componentSourcesTypeName
 }
 
 type (
@@ -88,14 +91,22 @@ type (
 type (
 	// DMServerConfigs represents the server runtime configuration
 	DMServerConfigs struct {
-		Master map[string]interface{} `yaml:"master"`
-		Worker map[string]interface{} `yaml:"worker"`
+		Master  map[string]any    `yaml:"master"`
+		Worker  map[string]any    `yaml:"worker"`
+		Grafana map[string]string `yaml:"grafana"`
+	}
+
+	// ComponentSources represents the source of components
+	ComponentSources struct {
+		Master string `yaml:"master,omitempty"`
+		Worker string `yaml:"worker,omitempty"`
 	}
 
 	// Specification represents the specification of topology.yaml
 	Specification struct {
 		GlobalOptions    GlobalOptions            `yaml:"global,omitempty" validate:"global:editable"`
 		MonitoredOptions *MonitoredOptions        `yaml:"monitored,omitempty" validate:"monitored:editable"`
+		ComponentSources ComponentSources         `yaml:"component_sources,omitempty" validate:"component_sources:editable"`
 		ServerConfigs    DMServerConfigs          `yaml:"server_configs,omitempty" validate:"server_configs:ignore"`
 		Masters          []*MasterSpec            `yaml:"master_servers"`
 		Workers          []*WorkerSpec            `yaml:"worker_servers"`
@@ -118,29 +129,35 @@ func AllDMComponentNames() (roles []string) {
 
 // MasterSpec represents the Master topology specification in topology.yaml
 type MasterSpec struct {
-	Host     string `yaml:"host"`
-	SSHPort  int    `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
-	Imported bool   `yaml:"imported,omitempty"`
-	Patched  bool   `yaml:"patched,omitempty"`
+	Host           string `yaml:"host"`
+	ManageHost     string `yaml:"manage_host,omitempty" validate:"manage_host:editable"`
+	SSHPort        int    `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
+	Patched        bool   `yaml:"patched,omitempty"`
+	IgnoreExporter bool   `yaml:"ignore_exporter,omitempty"`
 	// Use Name to get the name with a default value if it's empty.
-	Name            string                 `yaml:"name,omitempty"`
-	Port            int                    `yaml:"port,omitempty" default:"8261"`
-	PeerPort        int                    `yaml:"peer_port,omitempty" default:"8291"`
-	DeployDir       string                 `yaml:"deploy_dir,omitempty"`
-	DataDir         string                 `yaml:"data_dir,omitempty"`
-	LogDir          string                 `yaml:"log_dir,omitempty"`
-	NumaNode        string                 `yaml:"numa_node,omitempty" validate:"numa_node:editable"`
-	Config          map[string]interface{} `yaml:"config,omitempty" validate:"config:ignore"`
-	ResourceControl ResourceControl        `yaml:"resource_control,omitempty" validate:"resource_control:editable"`
-	Arch            string                 `yaml:"arch,omitempty"`
-	OS              string                 `yaml:"os,omitempty"`
-	V1SourcePath    string                 `yaml:"v1_source_path,omitempty"`
+	Name            string          `yaml:"name,omitempty"`
+	Port            int             `yaml:"port,omitempty" default:"8261"`
+	PeerPort        int             `yaml:"peer_port,omitempty" default:"8291"`
+	DeployDir       string          `yaml:"deploy_dir,omitempty"`
+	DataDir         string          `yaml:"data_dir,omitempty"`
+	LogDir          string          `yaml:"log_dir,omitempty"`
+	Source          string          `yaml:"source,omitempty" validate:"source:editable"`
+	NumaNode        string          `yaml:"numa_node,omitempty" validate:"numa_node:editable"`
+	Config          map[string]any  `yaml:"config,omitempty" validate:"config:ignore"`
+	ResourceControl ResourceControl `yaml:"resource_control,omitempty" validate:"resource_control:editable"`
+	Arch            string          `yaml:"arch,omitempty"`
+	OS              string          `yaml:"os,omitempty"`
+	V1SourcePath    string          `yaml:"v1_source_path,omitempty"`
 }
 
 // Status queries current status of the instance
-func (s *MasterSpec) Status(tlsCfg *tls.Config, _ ...string) string {
-	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
-	dc := api.NewDMMasterClient([]string{addr}, statusQueryTimeout, tlsCfg)
+func (s *MasterSpec) Status(_ context.Context, timeout time.Duration, tlsCfg *tls.Config, _ ...string) string {
+	if timeout < time.Second {
+		timeout = statusQueryTimeout
+	}
+
+	addr := utils.JoinHostPort(s.Host, s.Port)
+	dc := api.NewDMMasterClient([]string{addr}, timeout, tlsCfg)
 	isFound, isActive, isLeader, err := dc.GetMaster(s.Name)
 	if err != nil {
 		return "Down"
@@ -165,7 +182,11 @@ func (s *MasterSpec) Role() string {
 
 // SSH returns the host and SSH port of the instance
 func (s *MasterSpec) SSH() (string, int) {
-	return s.Host, s.SSHPort
+	host := s.Host
+	if s.ManageHost != "" {
+		host = s.ManageHost
+	}
+	return host, s.SSHPort
 }
 
 // GetMainPort returns the main port of the instance
@@ -173,36 +194,49 @@ func (s *MasterSpec) GetMainPort() int {
 	return s.Port
 }
 
-// IsImported returns if the node is imported from TiDB-Ansible
-func (s *MasterSpec) IsImported() bool {
-	return s.Imported
+// IgnoreMonitorAgent returns if the node does not have monitor agents available
+func (s *MasterSpec) IgnoreMonitorAgent() bool {
+	return s.IgnoreExporter
+}
+
+// GetAdvertisePeerURL returns AdvertisePeerURL
+func (s *MasterSpec) GetAdvertisePeerURL(enableTLS bool) string {
+	scheme := utils.Ternary(enableTLS, "https", "http").(string)
+	return fmt.Sprintf("%s://%s", scheme, utils.JoinHostPort(s.Host, s.PeerPort))
 }
 
 // WorkerSpec represents the Master topology specification in topology.yaml
 type WorkerSpec struct {
-	Host     string `yaml:"host"`
-	SSHPort  int    `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
-	Imported bool   `yaml:"imported,omitempty"`
-	Patched  bool   `yaml:"patched,omitempty"`
+	Host           string `yaml:"host"`
+	ManageHost     string `yaml:"manage_host,omitempty" validate:"manage_host:editable"`
+	SSHPort        int    `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
+	Imported       bool   `yaml:"-"`
+	Patched        bool   `yaml:"patched,omitempty"`
+	IgnoreExporter bool   `yaml:"ignore_exporter,omitempty"`
 	// Use Name to get the name with a default value if it's empty.
-	Name            string                 `yaml:"name,omitempty"`
-	Port            int                    `yaml:"port,omitempty" default:"8262"`
-	DeployDir       string                 `yaml:"deploy_dir,omitempty"`
-	DataDir         string                 `yaml:"data_dir,omitempty"`
-	LogDir          string                 `yaml:"log_dir,omitempty"`
-	NumaNode        string                 `yaml:"numa_node,omitempty" validate:"numa_node:editable"`
-	Config          map[string]interface{} `yaml:"config,omitempty" validate:"config:ignore"`
-	ResourceControl ResourceControl        `yaml:"resource_control,omitempty" validate:"resource_control:editable"`
-	Arch            string                 `yaml:"arch,omitempty"`
-	OS              string                 `yaml:"os,omitempty"`
+	Name            string          `yaml:"name,omitempty"`
+	Port            int             `yaml:"port,omitempty" default:"8262"`
+	DeployDir       string          `yaml:"deploy_dir,omitempty"`
+	DataDir         string          `yaml:"data_dir,omitempty"`
+	LogDir          string          `yaml:"log_dir,omitempty"`
+	Source          string          `yaml:"source,omitempty" validate:"source:editable"`
+	NumaNode        string          `yaml:"numa_node,omitempty" validate:"numa_node:editable"`
+	Config          map[string]any  `yaml:"config,omitempty" validate:"config:ignore"`
+	ResourceControl ResourceControl `yaml:"resource_control,omitempty" validate:"resource_control:editable"`
+	Arch            string          `yaml:"arch,omitempty"`
+	OS              string          `yaml:"os,omitempty"`
 }
 
 // Status queries current status of the instance
-func (s *WorkerSpec) Status(tlsCfg *tls.Config, masterList ...string) string {
+func (s *WorkerSpec) Status(_ context.Context, timeout time.Duration, tlsCfg *tls.Config, masterList ...string) string {
 	if len(masterList) < 1 {
 		return "N/A"
 	}
-	dc := api.NewDMMasterClient(masterList, statusQueryTimeout, tlsCfg)
+
+	if timeout < time.Second {
+		timeout = statusQueryTimeout
+	}
+	dc := api.NewDMMasterClient(masterList, timeout, tlsCfg)
 	stage, err := dc.GetWorker(s.Name)
 	if err != nil {
 		return "Down"
@@ -220,7 +254,11 @@ func (s *WorkerSpec) Role() string {
 
 // SSH returns the host and SSH port of the instance
 func (s *WorkerSpec) SSH() (string, int) {
-	return s.Host, s.SSHPort
+	host := s.Host
+	if s.ManageHost != "" {
+		host = s.ManageHost
+	}
+	return host, s.SSHPort
 }
 
 // GetMainPort returns the main port of the instance
@@ -228,13 +266,13 @@ func (s *WorkerSpec) GetMainPort() int {
 	return s.Port
 }
 
-// IsImported returns if the node is imported from TiDB-Ansible
-func (s *WorkerSpec) IsImported() bool {
-	return s.Imported
+// IgnoreMonitorAgent returns if the node does not have monitor agents available
+func (s *WorkerSpec) IgnoreMonitorAgent() bool {
+	return s.IgnoreExporter
 }
 
 // UnmarshalYAML sets default values when unmarshaling the topology file
-func (s *Specification) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (s *Specification) UnmarshalYAML(unmarshal func(any) error) error {
 	type topology Specification
 	if err := unmarshal((*topology)(s)); err != nil {
 		return err
@@ -283,7 +321,7 @@ func (s *Specification) platformConflictsDetect() error {
 
 	platformStats := map[string]conflict{}
 	topoSpec := reflect.ValueOf(s).Elem()
-	topoType := reflect.TypeOf(s).Elem()
+	topoType := reflect.TypeFor[Specification]()
 
 	for i := 0; i < topoSpec.NumField(); i++ {
 		if isSkipField(topoSpec.Field(i)) {
@@ -293,10 +331,6 @@ func (s *Specification) platformConflictsDetect() error {
 		compSpecs := topoSpec.Field(i)
 		for index := 0; index < compSpecs.Len(); index++ {
 			compSpec := reflect.Indirect(compSpecs.Index(index))
-			// skip nodes imported from TiDB-Ansible
-			if compSpec.Addr().Interface().(InstanceSpec).IsImported() {
-				continue
-			}
 			// check hostname
 			host := compSpec.FieldByName("Host").String()
 			cfg := topoType.Field(i).Tag.Get("yaml")
@@ -359,7 +393,7 @@ func (s *Specification) portConflictsDetect() error {
 	portStats := map[usedPort]conflict{}
 	uniqueHosts := set.NewStringSet()
 	topoSpec := reflect.ValueOf(s).Elem()
-	topoType := reflect.TypeOf(s).Elem()
+	topoType := reflect.TypeFor[Specification]()
 
 	for i := 0; i < topoSpec.NumField(); i++ {
 		if isSkipField(topoSpec.Field(i)) {
@@ -369,10 +403,6 @@ func (s *Specification) portConflictsDetect() error {
 		compSpecs := topoSpec.Field(i)
 		for index := 0; index < compSpecs.Len(); index++ {
 			compSpec := reflect.Indirect(compSpecs.Index(index))
-			// skip nodes imported from TiDB-Ansible
-			if compSpec.Addr().Interface().(InstanceSpec).IsImported() {
-				continue
-			}
 			// check hostname
 			host := compSpec.FieldByName("Host").String()
 			cfg := topoType.Field(i).Tag.Get("yaml")
@@ -476,7 +506,7 @@ func (s *Specification) dirConflictsDetect() error {
 	)
 
 	topoSpec := reflect.ValueOf(s).Elem()
-	topoType := reflect.TypeOf(s).Elem()
+	topoType := reflect.TypeFor[Specification]()
 
 	for i := 0; i < topoSpec.NumField(); i++ {
 		if isSkipField(topoSpec.Field(i)) {
@@ -486,10 +516,6 @@ func (s *Specification) dirConflictsDetect() error {
 		compSpecs := topoSpec.Field(i)
 		for index := 0; index < compSpecs.Len(); index++ {
 			compSpec := reflect.Indirect(compSpecs.Index(index))
-			// skip nodes imported from TiDB-Ansible
-			if compSpec.Addr().Interface().(InstanceSpec).IsImported() {
-				continue
-			}
 			// check hostname
 			host := compSpec.FieldByName("Host").String()
 			cfg := topoType.Field(i).Tag.Get("yaml")
@@ -636,7 +662,7 @@ func (s *Specification) BaseTopo() *spec.BaseTopo {
 	return &spec.BaseTopo{
 		GlobalOptions:    &s.GlobalOptions,
 		MonitoredOptions: s.GetMonitoredOptions(),
-		MasterList:       s.GetMasterList(),
+		MasterList:       s.GetMasterListWithManageHost(),
 		Monitors:         s.Monitors,
 		Grafanas:         s.Grafanas,
 		Alertmanagers:    s.Alertmanagers,
@@ -662,15 +688,24 @@ func (s *Specification) MergeTopo(rhs spec.Topology) spec.Topology {
 	return s.Merge(other)
 }
 
-// GetMasterList returns a list of Master API hosts of the current cluster
-func (s *Specification) GetMasterList() []string {
+// GetMasterListWithManageHost returns a list of Master API hosts of the current cluster
+func (s *Specification) GetMasterListWithManageHost() []string {
 	var masterList []string
 
 	for _, master := range s.Masters {
-		masterList = append(masterList, fmt.Sprintf("%s:%d", master.Host, master.Port))
+		host := master.Host
+		if master.ManageHost != "" {
+			host = master.ManageHost
+		}
+		masterList = append(masterList, utils.JoinHostPort(host, master.Port))
 	}
 
 	return masterList
+}
+
+// FillHostArchOrOS fills the topology with the given host->arch
+func (s *Specification) FillHostArchOrOS(hostArch map[string]string, fullType spec.FullHostType) error {
+	return spec.FillHostArchOrOS(s, hostArch, fullType)
 }
 
 // Merge returns a new Topology which sum old ones
@@ -689,7 +724,7 @@ func (s *Specification) Merge(that spec.Topology) spec.Topology {
 }
 
 // fillDefaults tries to fill custom fields to their default values
-func fillDMCustomDefaults(globalOptions *GlobalOptions, data interface{}) error {
+func fillDMCustomDefaults(globalOptions *GlobalOptions, data any) error {
 	v := reflect.ValueOf(data).Elem()
 	t := v.Type()
 
@@ -722,7 +757,7 @@ func setDMCustomDefaults(globalOptions *GlobalOptions, field reflect.Value) erro
 			return err
 		}
 		field.Set(ref.Elem())
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if err := setDMCustomDefaults(globalOptions, field.Elem()); err != nil {
 			return err
 		}
@@ -777,12 +812,6 @@ func setDMCustomDefaults(globalOptions *GlobalOptions, field reflect.Value) erro
 				field.Field(j).Set(reflect.ValueOf(globalOptions.LogDir))
 			}
 		case "Arch":
-			// default values of globalOptions are set before fillCustomDefaults in Unmarshal
-			// so the globalOptions.Arch already has its default value set, no need to check again
-			if field.Field(j).String() == "" {
-				field.Field(j).Set(reflect.ValueOf(globalOptions.Arch))
-			}
-
 			switch strings.ToLower(field.Field(j).String()) {
 			// replace "x86_64" with amd64, they are the same in our repo
 			case "x86_64":
@@ -797,10 +826,6 @@ func setDMCustomDefaults(globalOptions *GlobalOptions, field reflect.Value) erro
 				field.Field(j).Set(reflect.ValueOf(strings.ToLower(field.Field(j).String())))
 			}
 		case "OS":
-			// default value of globalOptions.OS is already set, same as "Arch"
-			if field.Field(j).String() == "" {
-				field.Field(j).Set(reflect.ValueOf(globalOptions.OS))
-			}
 			// convert to lower case
 			if field.Field(j).String() != "" {
 				field.Field(j).Set(reflect.ValueOf(strings.ToLower(field.Field(j).String())))
@@ -819,4 +844,9 @@ func getPort(v reflect.Value) string {
 		}
 	}
 	return ""
+}
+
+// GetGrafanaConfig returns global grafana configurations
+func (s *Specification) GetGrafanaConfig() map[string]string {
+	return s.ServerConfigs.Grafana
 }

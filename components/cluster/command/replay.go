@@ -20,9 +20,9 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/checkpoint"
-	"github.com/pingcap/tiup/pkg/cliutil"
 	"github.com/pingcap/tiup/pkg/cluster/audit"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
+	"github.com/pingcap/tiup/pkg/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -48,8 +48,8 @@ func newReplayCmd() *cobra.Command {
 			}
 
 			if !skipConfirm {
-				if err := cliutil.PromptForConfirmOrAbortError(
-					fmt.Sprintf("Will replay the command `tiup cluster %s`\nDo you want to continue? [y/N]: ", strings.Join(args[1:], " ")),
+				if err := tui.PromptForConfirmOrAbortError(
+					"%s", fmt.Sprintf("Will replay the command `tiup cluster %s`\nDo you want to continue? [y/N]: ", strings.Join(args[1:], " ")),
 				); err != nil {
 					return err
 				}

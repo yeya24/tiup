@@ -14,68 +14,55 @@
 package command
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
+	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/google/uuid"
 	"github.com/joomcode/errorx"
-	"github.com/pingcap/tiup/pkg/cliutil"
+	perrs "github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/cluster/executor"
-	"github.com/pingcap/tiup/pkg/cluster/flags"
 	"github.com/pingcap/tiup/pkg/cluster/manager"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
-	"github.com/pingcap/tiup/pkg/cluster/report"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
-	"github.com/pingcap/tiup/pkg/colorutil"
 	tiupmeta "github.com/pingcap/tiup/pkg/environment"
-	"github.com/pingcap/tiup/pkg/errutil"
 	"github.com/pingcap/tiup/pkg/localdata"
 	"github.com/pingcap/tiup/pkg/logger"
-	"github.com/pingcap/tiup/pkg/logger/log"
+	logprinter "github.com/pingcap/tiup/pkg/logger/printer"
+	"github.com/pingcap/tiup/pkg/proxy"
 	"github.com/pingcap/tiup/pkg/repository"
-	"github.com/pingcap/tiup/pkg/telemetry"
+
+	"github.com/pingcap/tiup/pkg/tui"
+	"github.com/pingcap/tiup/pkg/utils"
 	"github.com/pingcap/tiup/pkg/version"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
 var (
-	errNS       = errorx.NewNamespace("cmd")
 	rootCmd     *cobra.Command
 	gOpt        operator.Options
 	skipConfirm bool
+	log         = logprinter.NewLogger("") // init default logger
+	profileDir  string
+	profileFile *os.File
+	profileTS   string
 )
 
-var tidbSpec *spec.SpecManager
-var cm *manager.Manager
-
-func scrubClusterName(n string) string {
-	return "cluster_" + telemetry.HashReport(n)
-}
-
-func getParentNames(cmd *cobra.Command) []string {
-	if cmd == nil {
-		return nil
-	}
-
-	p := cmd.Parent()
-	// always use 'cluster' as the root command name
-	if cmd.Parent() == nil {
-		return []string{"cluster"}
-	}
-
-	return append(getParentNames(p), cmd.Name())
-}
+var (
+	tidbSpec *spec.SpecManager
+	cm       *manager.Manager
+)
 
 func init() {
 	logger.InitGlobalLogger()
 
-	colorutil.AddColorFunctionsForCobra()
+	tui.AddColorFunctionsForCobra()
 
 	cobra.EnableCommandSorting = false
 
@@ -85,12 +72,17 @@ func init() {
 	}
 
 	rootCmd = &cobra.Command{
-		Use:           cliutil.OsArgs0(),
+		Use:           tui.OsArgs0(),
 		Short:         "Deploy a TiDB cluster for production",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       version.NewTiUPVersion().String(),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			startProfiler(profileDir)
+
+			// populate logger
+			log.SetDisplayModeFromString(gOpt.DisplayMode)
+
 			var err error
 			var env *tiupmeta.Environment
 			if err = spec.Initialize("cluster"); err != nil {
@@ -98,45 +90,76 @@ func init() {
 			}
 
 			tidbSpec = spec.GetSpecManager()
-			cm = manager.NewManager("tidb", tidbSpec, spec.TiDBComponentVersion)
-			logger.EnableAuditLog(spec.AuditDir())
+			cm = manager.NewManager("tidb", tidbSpec, log)
+			if cmd.Name() != "__complete" {
+				logger.EnableAuditLog(spec.AuditDir())
+			}
 
 			// Running in other OS/ARCH Should be fine we only download manifest file.
 			env, err = tiupmeta.InitEnv(repository.Options{
 				GOOS:   "linux",
 				GOARCH: "amd64",
-			})
+			}, repository.MirrorOptions{})
 			if err != nil {
 				return err
 			}
 			tiupmeta.SetGlobalEnv(env)
 
-			teleCommand = getParentNames(cmd)
-
 			if gOpt.NativeSSH {
 				gOpt.SSHType = executor.SSHTypeSystem
-				zap.L().Info("System ssh client will be used",
-					zap.String(localdata.EnvNameNativeSSHClient, os.Getenv(localdata.EnvNameNativeSSHClient)))
-				fmt.Println("The --native-ssh flag has been deprecated, please use --ssh=system")
+				log.Infof(
+					"System ssh client will be used (%s=%s)",
+					localdata.EnvNameNativeSSHClient,
+					os.Getenv(localdata.EnvNameNativeSSHClient))
+				log.Infof("The --native-ssh flag has been deprecated, please use --ssh=system")
+			}
+
+			err = proxy.MaybeStartProxy(
+				gOpt.SSHProxyHost,
+				gOpt.SSHProxyPort,
+				gOpt.SSHProxyUser,
+				gOpt.SSHProxyUsePassword,
+				gOpt.SSHProxyIdentity,
+				log,
+			)
+			if err != nil {
+				return perrs.Annotate(err, "start http-proxy")
 			}
 
 			return nil
 		},
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-			return tiupmeta.GlobalEnv().V1Repository().Mirror().Close()
+			stopProfiler(profileDir)
+			proxy.MaybeStopProxy()
+			return tiupmeta.GlobalEnv().Close()
 		},
 	}
 
-	cliutil.BeautifyCobraUsageAndHelp(rootCmd)
+	tui.BeautifyCobraUsageAndHelp(rootCmd)
 
 	rootCmd.PersistentFlags().Uint64Var(&gOpt.SSHTimeout, "ssh-timeout", 5, "Timeout in seconds to connect host via SSH, ignored for operations that don't need an SSH connection.")
 	// the value of wait-timeout is also used for `systemctl` commands, as the default timeout of systemd for
 	// start/stop operations is 90s, the default value of this argument is better be longer than that
 	rootCmd.PersistentFlags().Uint64Var(&gOpt.OptTimeout, "wait-timeout", 120, "Timeout in seconds to wait for an operation to complete, ignored for operations that don't fit.")
 	rootCmd.PersistentFlags().BoolVarP(&skipConfirm, "yes", "y", false, "Skip all confirmations and assumes 'yes'")
-	rootCmd.PersistentFlags().BoolVar(&gOpt.NativeSSH, "native-ssh", gOpt.NativeSSH, "(EXPERIMENTAL) Use the native SSH client installed on local system instead of the build-in one.")
-	rootCmd.PersistentFlags().StringVar((*string)(&gOpt.SSHType), "ssh", "", "(EXPERIMENTAL) The executor type: 'builtin', 'system', 'none'.")
+	rootCmd.PersistentFlags().BoolVar(&gOpt.NativeSSH, "native-ssh", gOpt.NativeSSH, "(EXPERIMENTAL) Use the native SSH client installed on local system instead of the built-in one.")
+	rootCmd.PersistentFlags().StringVar((*string)(&gOpt.SSHType), "ssh", "", "(EXPERIMENTAL) The executor type: 'builtin', 'system', 'none' (default \"builtin\").")
+	rootCmd.PersistentFlags().IntVarP(&gOpt.Concurrency, "concurrency", "c", 5, "max number of parallel tasks allowed")
+	rootCmd.PersistentFlags().StringVar(&gOpt.DisplayMode, "format", "default", "(EXPERIMENTAL) The format of output, available values are [default, json]")
+	rootCmd.PersistentFlags().StringVar(&gOpt.SSHProxyHost, "ssh-proxy-host", "", "The SSH proxy host used to connect to remote host.")
+	rootCmd.PersistentFlags().StringVar(&gOpt.SSHProxyUser, "ssh-proxy-user", utils.CurrentUser(), "The user name used to login the proxy host.")
+	rootCmd.PersistentFlags().IntVar(&gOpt.SSHProxyPort, "ssh-proxy-port", 22, "The port used to login the proxy host.")
+	rootCmd.PersistentFlags().StringVar(&gOpt.SSHProxyIdentity, "ssh-proxy-identity-file", path.Join(utils.UserHome(), ".ssh", "id_rsa"), "The identity file used to login the proxy host.")
+	rootCmd.PersistentFlags().BoolVar(&gOpt.SSHProxyUsePassword, "ssh-proxy-use-password", false, "Use password to login the proxy host.")
+	rootCmd.PersistentFlags().Uint64Var(&gOpt.SSHProxyTimeout, "ssh-proxy-timeout", 5, "Timeout in seconds to connect the proxy host via SSH, ignored for operations that don't need an SSH connection.")
+	rootCmd.PersistentFlags().StringVar(&profileDir, "profile-dir", "", "Write cpu/heap pprof profiles into this directory")
 	_ = rootCmd.PersistentFlags().MarkHidden("native-ssh")
+	_ = rootCmd.PersistentFlags().MarkHidden("ssh-proxy-host")
+	_ = rootCmd.PersistentFlags().MarkHidden("ssh-proxy-user")
+	_ = rootCmd.PersistentFlags().MarkHidden("ssh-proxy-port")
+	_ = rootCmd.PersistentFlags().MarkHidden("ssh-proxy-identity-file")
+	_ = rootCmd.PersistentFlags().MarkHidden("ssh-proxy-use-password")
+	_ = rootCmd.PersistentFlags().MarkHidden("ssh-proxy-timeout")
 
 	rootCmd.AddCommand(
 		newCheckCmd(),
@@ -153,8 +176,8 @@ func init() {
 		newPruneCmd(),
 		newListCmd(),
 		newAuditCmd(),
-		newImportCmd(),
 		newEditConfigCmd(),
+		newShowConfigCmd(),
 		newReloadCmd(),
 		newPatchCmd(),
 		newRenameCmd(),
@@ -164,31 +187,89 @@ func init() {
 		newPullCmd(),
 		newPushCmd(),
 		newTestCmd(), // hidden command for test internally
-		newTelemetryCmd(),
 		newReplayCmd(),
 		newTemplateCmd(),
+		newTLSCmd(),
+		newMetaCmd(),
+		newRotateSSHCmd(),
 	)
 }
 
+func startProfiler(dir string) {
+	if dir == "" {
+		return
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create profile dir %q: %v\n", dir, err)
+		return
+	}
+
+	timestamp := time.Now().Format("20060102-150405")
+	pid := os.Getpid()
+	cpuPath := filepath.Join(dir, fmt.Sprintf("cpu-%d-%s.pprof", pid, timestamp))
+	f, err := os.Create(cpuPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create cpu profile %q: %v\n", cpuPath, err)
+		return
+	}
+
+	if err := pprof.StartCPUProfile(f); err != nil {
+		_ = f.Close()
+		fmt.Fprintf(os.Stderr, "failed to start cpu profile: %v\n", err)
+		return
+	}
+
+	profileTS = timestamp
+	profileFile = f
+}
+
+func stopProfiler(dir string) {
+	if dir == "" {
+		return
+	}
+
+	pprof.StopCPUProfile()
+	if profileFile != nil {
+		defer profileFile.Close()
+		profileFile = nil
+	}
+
+	pid := os.Getpid()
+
+	if prof := pprof.Lookup("heap"); prof != nil {
+		outPath := filepath.Join(dir, fmt.Sprintf("heap-%d-%s.pprof", pid, profileTS))
+		f, err := os.Create(outPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create heap profile %q: %v\n", outPath, err)
+			return
+		}
+		defer f.Close()
+		if err := prof.WriteTo(f, 0); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write heap profile %q: %v\n", outPath, err)
+		}
+	}
+}
+
 func printErrorMessageForNormalError(err error) {
-	_, _ = colorutil.ColorErrorMsg.Fprintf(os.Stderr, "\nError: %s\n", err.Error())
+	_, _ = tui.ColorErrorMsg.Fprintf(os.Stderr, "\nError: %s\n", err.Error())
 }
 
 func printErrorMessageForErrorX(err *errorx.Error) {
-	msg := ""
+	var msg strings.Builder
 	ident := 0
 	causeErrX := err
 	for causeErrX != nil {
 		if ident > 0 {
-			msg += strings.Repeat("  ", ident) + "caused by: "
+			msg.WriteString(strings.Repeat("  ", ident) + "caused by: ")
 		}
 		currentErrMsg := causeErrX.Message()
 		if len(currentErrMsg) > 0 {
 			if ident == 0 {
 				// Print error code only for top level error
-				msg += fmt.Sprintf("%s (%s)\n", currentErrMsg, causeErrX.Type().FullName())
+				msg.WriteString(fmt.Sprintf("%s (%s)\n", currentErrMsg, causeErrX.Type().FullName()))
 			} else {
-				msg += fmt.Sprintf("%s\n", currentErrMsg)
+				msg.WriteString(fmt.Sprintf("%s\n", currentErrMsg))
 			}
 			ident++
 		}
@@ -200,20 +281,20 @@ func printErrorMessageForErrorX(err *errorx.Error) {
 				if ident > 0 {
 					// The error may have empty message. In this case we treat it as a transparent error.
 					// Thus `ident == 0` can be possible.
-					msg += strings.Repeat("  ", ident) + "caused by: "
+					msg.WriteString(strings.Repeat("  ", ident) + "caused by: ")
 				}
-				msg += fmt.Sprintf("%s\n", cause.Error())
+				msg.WriteString(fmt.Sprintf("%s\n", cause.Error()))
 			}
 			break
 		}
 	}
-	_, _ = colorutil.ColorErrorMsg.Fprintf(os.Stderr, "\nError: %s", msg)
+	_, _ = tui.ColorErrorMsg.Fprintf(os.Stderr, "\nError: %s", msg.String())
 }
 
 func extractSuggestionFromErrorX(err *errorx.Error) string {
 	cause := err
 	for cause != nil {
-		v, ok := cause.Property(errutil.ErrPropSuggestion)
+		v, ok := cause.Property(utils.ErrPropSuggestion)
 		if ok {
 			if s, ok := v.(string); ok {
 				return s
@@ -225,28 +306,16 @@ func extractSuggestionFromErrorX(err *errorx.Error) string {
 	return ""
 }
 
-// Execute executes the root command
+// Execute executes the root command.
+// (e.g. profiling) before exiting.
 func Execute() {
-	zap.L().Info("Execute command", zap.String("command", cliutil.OsArgs()))
-	zap.L().Debug("Environment variables", zap.Strings("env", os.Environ()))
-
-	// Switch current work directory if running in TiUP component mode
-	if wd := os.Getenv(localdata.EnvNameWorkDir); wd != "" {
-		if err := os.Chdir(wd); err != nil {
-			zap.L().Warn("Failed to switch work directory", zap.String("working_dir", wd), zap.Error(err))
-		}
+	zap.L().Info("Execute command", zap.String("command", tui.OsArgs()))
+	if tiupmeta.DebugMode {
+		zap.L().Debug("Environment variables", zap.Strings("env", os.Environ()))
+	} else {
+		zap.L().Debug("Environment variables", zap.Strings("env", tiupmeta.WhitelistedEnvs()))
 	}
 
-	teleReport = new(telemetry.Report)
-	clusterReport = new(telemetry.ClusterReport)
-	teleReport.EventDetail = &telemetry.Report_Cluster{Cluster: clusterReport}
-	if report.Enable() {
-		teleReport.EventUUID = uuid.New().String()
-		teleReport.EventUnixTimestamp = time.Now().Unix()
-		clusterReport.UUID = report.UUID()
-	}
-
-	start := time.Now()
 	code := 0
 	err := rootCmd.Execute()
 	if err != nil {
@@ -255,61 +324,41 @@ func Execute() {
 
 	zap.L().Info("Execute command finished", zap.Int("code", code), zap.Error(err))
 
-	if report.Enable() {
-		f := func() {
-			defer func() {
-				if r := recover(); r != nil {
-					if flags.DebugMode {
-						fmt.Println("Recovered in telemetry report", r)
-					}
-				}
-			}()
-
-			clusterReport.ExitCode = int32(code)
-			clusterReport.Nodes = teleNodeInfos
-			if teleTopology != "" {
-				if data, err := telemetry.ScrubYaml([]byte(teleTopology), map[string]struct{}{"host": {}}); err == nil {
-					clusterReport.Topology = (string(data))
-				}
+	switch log.GetDisplayMode() {
+	case logprinter.DisplayModeJSON:
+		obj := struct {
+			Code int    `json:"exit_code"`
+			Err  string `json:"error,omitempty"`
+		}{
+			Code: code,
+		}
+		if err != nil {
+			obj.Err = err.Error()
+		}
+		data, err := json.Marshal(obj)
+		if err != nil {
+			fmt.Printf("{\"exit_code\":%d, \"error\":\"%s\"}", code, err)
+		}
+		fmt.Fprintln(os.Stderr, string(data))
+	default:
+		if err != nil {
+			if errx := errorx.Cast(err); errx != nil {
+				printErrorMessageForErrorX(errx)
+			} else {
+				printErrorMessageForNormalError(err)
 			}
-			clusterReport.TakeMilliseconds = uint64(time.Since(start).Milliseconds())
-			clusterReport.Command = strings.Join(teleCommand, " ")
-			tele := telemetry.NewTelemetry()
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
-			err := tele.Report(ctx, teleReport)
-			if flags.DebugMode {
-				if err != nil {
-					log.Infof("report failed: %v", err)
-				}
-				fmt.Printf("report: %s\n", teleReport.String())
-				if data, err := json.Marshal(teleReport); err == nil {
-					fmt.Printf("report: %s\n", string(data))
-				}
+
+			if !errorx.HasTrait(err, utils.ErrTraitPreCheck) {
+				logger.OutputDebugLog("tiup-cluster")
 			}
-			cancel()
-		}
 
-		f()
-	}
-
-	if err != nil {
-		if errx := errorx.Cast(err); errx != nil {
-			printErrorMessageForErrorX(errx)
-		} else {
-			printErrorMessageForNormalError(err)
-		}
-
-		if !errorx.HasTrait(err, errutil.ErrTraitPreCheck) {
-			logger.OutputDebugLog("tiup-cluster")
-		}
-
-		if errx := errorx.Cast(err); errx != nil {
-			if suggestion := extractSuggestionFromErrorX(errx); len(suggestion) > 0 {
-				_, _ = fmt.Fprintf(os.Stderr, "\n%s\n", suggestion)
+			if errx := errorx.Cast(err); errx != nil {
+				if suggestion := extractSuggestionFromErrorX(errx); len(suggestion) > 0 {
+					log.Errorf("\n%s\n", suggestion)
+				}
 			}
 		}
 	}
-
 	err = logger.OutputAuditLogIfEnabled()
 	if err != nil {
 		zap.L().Warn("Write audit log file failed", zap.Error(err))

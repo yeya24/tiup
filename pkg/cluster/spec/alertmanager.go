@@ -24,24 +24,29 @@ import (
 	"github.com/pingcap/tiup/pkg/cluster/template/config"
 	"github.com/pingcap/tiup/pkg/cluster/template/scripts"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/utils"
 )
 
 // AlertmanagerSpec represents the AlertManager topology specification in topology.yaml
 type AlertmanagerSpec struct {
 	Host            string               `yaml:"host"`
+	ManageHost      string               `yaml:"manage_host,omitempty" validate:"manage_host:editable"`
 	SSHPort         int                  `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
-	Imported        bool                 `yaml:"imported,omitempty"`
 	Patched         bool                 `yaml:"patched,omitempty"`
+	IgnoreExporter  bool                 `yaml:"ignore_exporter,omitempty"`
 	WebPort         int                  `yaml:"web_port" default:"9093"`
 	ClusterPort     int                  `yaml:"cluster_port" default:"9094"`
+	ListenHost      string               `yaml:"listen_host,omitempty" validate:"listen_host:editable"`
 	DeployDir       string               `yaml:"deploy_dir,omitempty"`
 	DataDir         string               `yaml:"data_dir,omitempty"`
 	LogDir          string               `yaml:"log_dir,omitempty"`
 	NumaNode        string               `yaml:"numa_node,omitempty" validate:"numa_node:editable"`
 	ResourceControl meta.ResourceControl `yaml:"resource_control,omitempty" validate:"resource_control:editable"`
-	Arch            string               `yaml:"arch,omitempty"`
-	OS              string               `yaml:"os,omitempty"`
-	ConfigFilePath  string               `yaml:"config_file,omitempty" validate:"config_file:editable"`
+	// This field allows users to define additional arguments for customization.
+	AdditionalArgs []string `yaml:"additional_args,omitempty" validate:"additional_args:ignore"`
+	Arch           string   `yaml:"arch,omitempty"`
+	OS             string   `yaml:"os,omitempty"`
+	ConfigFilePath string   `yaml:"config_file,omitempty" validate:"config_file:editable"`
 }
 
 // Role returns the component role of the instance
@@ -51,7 +56,11 @@ func (s *AlertmanagerSpec) Role() string {
 
 // SSH returns the host and SSH port of the instance
 func (s *AlertmanagerSpec) SSH() (string, int) {
-	return s.Host, s.SSHPort
+	host := s.Host
+	if s.ManageHost != "" {
+		host = s.ManageHost
+	}
+	return host, s.SSHPort
 }
 
 // GetMainPort returns the main port of the instance
@@ -59,9 +68,17 @@ func (s *AlertmanagerSpec) GetMainPort() int {
 	return s.WebPort
 }
 
-// IsImported returns if the node is imported from TiDB-Ansible
-func (s *AlertmanagerSpec) IsImported() bool {
-	return s.Imported
+// GetManageHost returns the manage host of the instance
+func (s *AlertmanagerSpec) GetManageHost() string {
+	if s.ManageHost != "" {
+		return s.ManageHost
+	}
+	return s.Host
+}
+
+// IgnoreMonitorAgent returns if the node does not have monitor agents available
+func (s *AlertmanagerSpec) IgnoreMonitorAgent() bool {
+	return s.IgnoreExporter
 }
 
 // AlertManagerComponent represents Alertmanager component.
@@ -77,9 +94,29 @@ func (c *AlertManagerComponent) Role() string {
 	return RoleMonitor
 }
 
+// Source implements Component interface.
+func (c *AlertManagerComponent) Source() string {
+	return ComponentAlertmanager
+}
+
+// CalculateVersion implements the Component interface
+func (c *AlertManagerComponent) CalculateVersion(_ string) string {
+	// always not follow cluster version, use ""(latest) by default
+	version := c.BaseTopo().AlertManagerVersion
+	if version != nil {
+		return *version
+	}
+	return ""
+}
+
+// SetVersion implements Component interface.
+func (c *AlertManagerComponent) SetVersion(version string) {
+	*c.BaseTopo().AlertManagerVersion = version
+}
+
 // Instances implements Component interface.
 func (c *AlertManagerComponent) Instances() []Instance {
-	alertmanagers := c.Topology.BaseTopo().Alertmanagers
+	alertmanagers := c.BaseTopo().Alertmanagers
 
 	ins := make([]Instance, 0, len(alertmanagers))
 
@@ -89,8 +126,12 @@ func (c *AlertManagerComponent) Instances() []Instance {
 				InstanceSpec: s,
 				Name:         c.Name(),
 				Host:         s.Host,
+				ManageHost:   s.ManageHost,
+				ListenHost:   utils.Ternary(s.ListenHost != "", s.ListenHost, c.BaseTopo().GlobalOptions.ListenHost).(string),
 				Port:         s.WebPort,
 				SSHP:         s.SSHPort,
+				NumaNode:     s.NumaNode,
+				NumaCores:    "",
 
 				Ports: []int{
 					s.WebPort,
@@ -100,12 +141,13 @@ func (c *AlertManagerComponent) Instances() []Instance {
 					s.DeployDir,
 					s.DataDir,
 				},
-				StatusFn: func(_ *tls.Config, _ ...string) string {
-					return statusByHost(s.Host, s.WebPort, "/-/ready", nil)
+				StatusFn: func(_ context.Context, timeout time.Duration, _ *tls.Config, _ ...string) string {
+					return statusByHost(s.GetManageHost(), s.WebPort, "/-/ready", timeout, nil)
 				},
-				UptimeFn: func(tlsCfg *tls.Config) time.Duration {
-					return UptimeByHost(s.Host, s.WebPort, tlsCfg)
+				UptimeFn: func(_ context.Context, timeout time.Duration, tlsCfg *tls.Config) time.Duration {
+					return UptimeByHost(s.GetManageHost(), s.WebPort, timeout, tlsCfg, "")
 				},
+				Component: c,
 			},
 			topo: c.Topology,
 		})
@@ -133,14 +175,33 @@ func (i *AlertManagerInstance) InitConfig(
 		return err
 	}
 
-	alertmanagers := i.topo.BaseTopo().Alertmanagers
-
-	enableTLS := gOpts.TLSEnabled
 	// Transfer start script
 	spec := i.InstanceSpec.(*AlertmanagerSpec)
-	cfg := scripts.NewAlertManagerScript(spec.Host, paths.Deploy, paths.Data[0], paths.Log, enableTLS).
-		WithWebPort(spec.WebPort).WithClusterPort(spec.ClusterPort).WithNumaNode(spec.NumaNode).
-		AppendEndpoints(AlertManagerEndpoints(alertmanagers, deployUser, enableTLS))
+
+	peers := []string{}
+	for _, amspec := range i.topo.BaseTopo().Alertmanagers {
+		peers = append(peers, utils.JoinHostPort(amspec.Host, amspec.ClusterPort))
+	}
+	cfg := &scripts.AlertManagerScript{
+		WebListenAddr:  utils.JoinHostPort(i.GetListenHost(), spec.WebPort),
+		WebExternalURL: fmt.Sprintf("http://%s", utils.JoinHostPort(spec.Host, spec.WebPort)),
+		ClusterPeers:   peers,
+		// ClusterListenAddr cannot use i.GetListenHost due to https://github.com/prometheus/alertmanager/issues/2284 and https://github.com/prometheus/alertmanager/issues/1271
+		ClusterListenAddr: utils.JoinHostPort(i.GetHost(), spec.ClusterPort),
+
+		DeployDir: paths.Deploy,
+		LogDir:    paths.Log,
+		DataDir:   paths.Data[0],
+
+		NumaNode: spec.NumaNode,
+		// This field allows users to define additional arguments for customization.
+		AdditionalArgs: spec.AdditionalArgs,
+	}
+
+	// doesn't work
+	if _, err := i.setTLSConfig(ctx, false, nil, paths); err != nil {
+		return err
+	}
 
 	fp := filepath.Join(paths.Cache, fmt.Sprintf("run_alertmanager_%s_%d.sh", i.GetHost(), i.GetPort()))
 	if err := cfg.ConfigToFile(fp); err != nil {
@@ -148,7 +209,7 @@ func (i *AlertManagerInstance) InitConfig(
 	}
 
 	dst := filepath.Join(paths.Deploy, "scripts", "run_alertmanager.sh")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 	if _, _, err := e.Execute(ctx, "chmod +x "+dst, false); err != nil {
@@ -167,7 +228,8 @@ func (i *AlertManagerInstance) InitConfig(
 	if err := i.TransferLocalConfigFile(ctx, e, configPath, dst); err != nil {
 		return err
 	}
-	return checkConfig(ctx, e, i.ComponentName(), clusterVersion, i.OS(), i.Arch(), i.ComponentName()+".yml", paths, nil)
+	// version is not used for alertmanager
+	return checkConfig(ctx, e, i.ComponentName(), i.ComponentSource(), "", i.OS(), i.Arch(), i.ComponentName()+".yml", paths)
 }
 
 // ScaleConfig deploy temporary config on scaling
@@ -184,4 +246,9 @@ func (i *AlertManagerInstance) ScaleConfig(
 	defer func() { i.topo = s }()
 	i.topo = topo
 	return i.InitConfig(ctx, e, clusterName, clusterVersion, deployUser, paths)
+}
+
+// setTLSConfig set TLS Config to support enable/disable TLS
+func (i *AlertManagerInstance) setTLSConfig(ctx context.Context, enableTLS bool, configs map[string]any, paths meta.DirPaths) (map[string]any, error) {
+	return nil, nil
 }

@@ -39,7 +39,6 @@ func newPatchCmd() *cobra.Command {
 				return perrs.New("the flag -R or -N must be specified at least one")
 			}
 			clusterName := args[0]
-			teleCommand = append(teleCommand, scrubClusterName(clusterName))
 
 			return cm.Patch(clusterName, args[1], gOpt, overwrite, offlineMode, skipConfirm)
 		},
@@ -48,7 +47,7 @@ func newPatchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "Use this package in the future scale-out operations")
 	cmd.Flags().StringSliceVarP(&gOpt.Nodes, "node", "N", nil, "Specify the nodes")
 	cmd.Flags().StringSliceVarP(&gOpt.Roles, "role", "R", nil, "Specify the roles")
-	cmd.Flags().Uint64Var(&gOpt.APITimeout, "transfer-timeout", 300, "Timeout in seconds when transferring PD and TiKV store leaders")
+	cmd.Flags().Uint64Var(&gOpt.APITimeout, "transfer-timeout", 600, "Timeout in seconds when transferring PD and TiKV store leaders, also for TiCDC drain one capture")
 	cmd.Flags().BoolVarP(&offlineMode, "offline", "", false, "Patch a stopped cluster")
 	return cmd
 }

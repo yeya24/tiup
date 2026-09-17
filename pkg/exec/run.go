@@ -14,93 +14,99 @@
 package exec
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/environment"
 	"github.com/pingcap/tiup/pkg/localdata"
-	"github.com/pingcap/tiup/pkg/telemetry"
+	"github.com/pingcap/tiup/pkg/repository"
+	"github.com/pingcap/tiup/pkg/tui/colorstr"
 	"github.com/pingcap/tiup/pkg/utils"
+	"github.com/pingcap/tiup/pkg/version"
 	"golang.org/x/mod/semver"
 )
 
+// Skip displaying "Starting component ..." message for some commonly used components.
+var skipStartingMessages = map[string]bool{
+	"playground":    true,
+	"playground-ng": true,
+	"cluster":       true,
+}
+
 // RunComponent start a component and wait it
-func RunComponent(env *environment.Environment, tag, spec, binPath string, args []string) error {
+func RunComponent(env *environment.Environment, tag, spec, binPath string, forcePull bool, args []string) error {
 	component, version := environment.ParseCompVersion(spec)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
-	// Clean data if current instance is a temporary
-	clean := tag == "" && os.Getenv(localdata.EnvNameInstanceDataDir) == ""
-
-	p, err := launchComponent(ctx, component, version, binPath, tag, args, env)
-	// If the process has been launched, we must save the process info to meta directory
-	if err == nil || (p != nil && p.Pid != 0) {
-		defer cleanDataDir(clean, p.Dir)
-		metaFile := filepath.Join(p.Dir, localdata.MetaFilename)
-		file, err := os.OpenFile(metaFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.ModePerm)
-		if err == nil {
-			defer file.Close()
-			encoder := json.NewEncoder(file)
-			encoder.SetIndent("", "    ")
-			_ = encoder.Encode(p)
-		}
+	if version == "" {
+		cmdCheckUpdate(component, version)
 	}
+
+	binPath, err := PrepareBinary(component, version, binPath, forcePull)
 	if err != nil {
-		fmt.Printf("Failed to start component `%s`\n", component)
 		return err
 	}
 
-	ch := make(chan error)
-	var sig syscall.Signal
+	// Clean data if current instance is a temporary
+	clean := tag == "" && os.Getenv(localdata.EnvNameInstanceDataDir) == ""
+	// p, err := launchComponent(component, version, binPath, tag, args, env)
+	instanceDir := os.Getenv(localdata.EnvNameInstanceDataDir)
+	if instanceDir == "" {
+		// Generate a tag for current instance if the tag doesn't specified
+		if tag == "" {
+			tag = utils.Base62Tag()
+		}
+		instanceDir = env.LocalPath(localdata.DataParentDir, tag)
+	}
+	defer cleanDataDir(clean, instanceDir)
+
+	params := &PrepareCommandParams{
+		Component:   component,
+		Version:     version,
+		BinPath:     binPath,
+		Tag:         tag,
+		InstanceDir: instanceDir,
+		Args:        args,
+		Env:         env,
+	}
+	c, err := PrepareCommand(params)
+	if err != nil {
+		return err
+	}
+
+	if skip, ok := skipStartingMessages[component]; !skip || !ok {
+		colorstr.Fprintf(os.Stderr, "Starting component [bold]%s[reset]: %s\n", component, strings.Join(environment.HideSensitiveInfo(c.Args), " "))
+	}
+
+	err = c.Start()
+	if err != nil {
+		return errors.Annotatef(err, "Failed to start component `%s`", component)
+	}
+	// If the process has been launched, we must save the process info to meta directory
+	if err := saveProcessInfo(params, c); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving process info %s\n", err.Error())
+	}
+
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-
-	defer func() {
-		for err := range ch {
-			if err != nil {
-				errs := err.Error()
-				if strings.Contains(errs, "signal") ||
-					(sig == syscall.SIGINT && strings.Contains(errs, "exit status 1")) {
-					continue
-				}
-				fmt.Printf("Component `%s` exit with error: %s\n", component, errs)
-				return
+	go func() {
+		for s := range sc {
+			sig := s.(syscall.Signal)
+			fmt.Fprintf(os.Stderr, "Got signal %v (Component: %v ; PID: %v)\n", s, component, c.Process.Pid)
+			if sig != syscall.SIGINT {
+				_ = syscall.Kill(c.Process.Pid, sig)
 			}
 		}
 	}()
 
-	go func() {
-		defer close(ch)
-		ch <- p.Cmd.Wait()
-	}()
-
-	select {
-	case s := <-sc:
-		sig = s.(syscall.Signal)
-		fmt.Printf("Got signal %v (Component: %v ; PID: %v)\n", s, component, p.Pid)
-		if component == "tidb" {
-			return syscall.Kill(p.Pid, syscall.SIGKILL)
-		}
-		if sig != syscall.SIGINT {
-			return syscall.Kill(p.Pid, sig)
-		}
-		return nil
-
-	case err := <-ch:
-		return errors.Annotatef(err, "run `%s` (wd:%s) failed", p.Exec, p.Dir)
-	}
+	return c.Wait()
 }
 
 func cleanDataDir(rm bool, dir string) {
@@ -108,96 +114,34 @@ func cleanDataDir(rm bool, dir string) {
 		return
 	}
 	if err := os.RemoveAll(dir); err != nil {
-		fmt.Println("clean data directory failed: ", err.Error())
+		fmt.Fprintln(os.Stderr, "clean data directory failed: ", err.Error())
 	}
-}
-
-func base62Tag() string {
-	const base = 62
-	const sets = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	b := make([]byte, 0)
-	num := time.Now().UnixNano() / int64(time.Millisecond)
-	for num > 0 {
-		r := math.Mod(float64(num), float64(base))
-		num /= base
-		b = append([]byte{sets[int(r)]}, b...)
-	}
-	return string(b)
 }
 
 // PrepareCommandParams for PrepareCommand.
 type PrepareCommandParams struct {
-	Ctx          context.Context
-	Component    string
-	Version      utils.Version
-	BinPath      string
-	Tag          string
-	InstanceDir  string
-	WD           string
-	Args         []string
-	EnvVariables []string
-	SysProcAttr  *syscall.SysProcAttr
-	Env          *environment.Environment
-	CheckUpdate  bool
+	Component   string
+	Version     utils.Version
+	BinPath     string
+	Tag         string
+	InstanceDir string
+	Args        []string
+	Env         *environment.Environment
 }
 
 // PrepareCommand will download necessary component and returns a *exec.Cmd
 func PrepareCommand(p *PrepareCommandParams) (*exec.Cmd, error) {
 	env := p.Env
-
-	selectVer, err := env.DownloadComponentIfMissing(p.Component, p.Version)
-	if err != nil {
-		return nil, err
-	}
-
-	if p.Version.IsEmpty() && p.CheckUpdate {
-		latestV, _, err := env.V1Repository().LatestStableVersion(p.Component, false)
-		if err != nil {
-			return nil, err
-		}
-		if semver.Compare(selectVer.String(), latestV.String()) < 0 {
-			fmt.Fprintln(os.Stderr, color.YellowString(`Found %[1]s newer version:
-
-    The latest version:         %[2]s
-    Local installed version:    %[3]s
-    Update current component:   tiup update %[1]s
-    Update all components:      tiup update --all
-`,
-				p.Component, latestV.String(), selectVer.String()))
-		}
-	}
-
-	// playground && cluster version must greater than v1.0.0
-	if (p.Component == "playground" || p.Component == "cluster") && semver.Compare(selectVer.String(), "v1.0.0") < 0 {
-		return nil, errors.Errorf("incompatible component version, please use `tiup update %s` to upgrade to the latest version", p.Component)
-	}
-
 	profile := env.Profile()
-	installPath, err := profile.ComponentInstalledPath(p.Component, selectVer)
-	if err != nil {
-		return nil, err
-	}
-
 	binPath := p.BinPath
-	if binPath != "" {
-		tmp, err := filepath.Abs(binPath)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		binPath = tmp
-	} else {
-		binPath, err = env.BinaryPath(p.Component, selectVer)
-		if err != nil {
-			return nil, err
-		}
-	}
+	installPath := filepath.Dir(binPath)
 
-	if err := os.MkdirAll(p.InstanceDir, 0755); err != nil {
+	if err := utils.MkdirAll(p.InstanceDir, 0755); err != nil {
 		return nil, err
 	}
 
 	sd := env.LocalPath(localdata.StorageParentDir, p.Component)
-	if err := os.MkdirAll(sd, 0755); err != nil {
+	if err := utils.MkdirAll(sd, 0755); err != nil {
 		return nil, err
 	}
 
@@ -206,79 +150,154 @@ func PrepareCommand(p *PrepareCommandParams) (*exec.Cmd, error) {
 		return nil, err
 	}
 
-	teleMeta, _, err := telemetry.GetMeta(env)
-	if err != nil {
-		return nil, err
-	}
-
 	envs := []string{
 		fmt.Sprintf("%s=%s", localdata.EnvNameHome, profile.Root()),
-		fmt.Sprintf("%s=%s", localdata.EnvNameWorkDir, tiupWd),
 		fmt.Sprintf("%s=%s", localdata.EnvNameUserInputVersion, p.Version.String()),
-		fmt.Sprintf("%s=%s", localdata.EnvNameInstanceDataDir, p.InstanceDir),
+		fmt.Sprintf("%s=%s", localdata.EnvNameTiUPVersion, version.NewTiUPVersion().SemVer()),
 		fmt.Sprintf("%s=%s", localdata.EnvNameComponentDataDir, sd),
 		fmt.Sprintf("%s=%s", localdata.EnvNameComponentInstallDir, installPath),
-		fmt.Sprintf("%s=%s", localdata.EnvNameTelemetryStatus, teleMeta.Status),
-		fmt.Sprintf("%s=%s", localdata.EnvNameTelemetryUUID, teleMeta.UUID),
+		// to be removed in TiUP 2.0
+		fmt.Sprintf("%s=%s", localdata.EnvNameWorkDir, tiupWd),
 		fmt.Sprintf("%s=%s", localdata.EnvTag, p.Tag),
+		fmt.Sprintf("%s=%s", localdata.EnvNameInstanceDataDir, p.InstanceDir),
 	}
 	envs = append(envs, os.Environ()...)
-	envs = append(envs, p.EnvVariables...)
 
 	// init the command
-	c := exec.CommandContext(p.Ctx, binPath, p.Args...)
+	c := exec.Command(binPath, p.Args...)
+
 	c.Env = envs
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
-	c.Dir = p.WD
-	c.SysProcAttr = p.SysProcAttr
 
 	return c, nil
 }
 
-func launchComponent(ctx context.Context, component string, version utils.Version, binPath string, tag string, args []string, env *environment.Environment) (*localdata.Process, error) {
-	instanceDir := os.Getenv(localdata.EnvNameInstanceDataDir)
-	if instanceDir == "" {
-		// Generate a tag for current instance if the tag doesn't specified
-		if tag == "" {
-			tag = base62Tag()
+func cmdCheckUpdate(component string, version utils.Version) {
+	const (
+		slowTimeout   = 1 * time.Second // Timeout to display checking message
+		cancelTimeout = 2 * time.Second // Timeout to cancel the check
+	)
+
+	// This mutex is used for protecting flag as well as stdout
+	mu := sync.Mutex{}
+	isCheckFinished := false
+
+	result := make(chan string, 1)
+
+	go func() {
+		time.Sleep(slowTimeout)
+		mu.Lock()
+		defer mu.Unlock()
+		if !isCheckFinished {
+			colorstr.Fprintf(os.Stderr, "Checking updates for component [bold]%s[reset]... ", component)
 		}
-		instanceDir = env.LocalPath(localdata.DataParentDir, tag)
-	}
+	}()
 
-	params := &PrepareCommandParams{
-		Ctx:         ctx,
-		Component:   component,
-		Version:     version,
-		BinPath:     binPath,
-		Tag:         tag,
-		InstanceDir: instanceDir,
-		WD:          "",
-		Args:        args,
-		SysProcAttr: nil,
-		Env:         env,
-		CheckUpdate: true,
-	}
-	c, err := PrepareCommand(params)
-	if err != nil {
-		return nil, err
-	}
+	go func() {
+		time.Sleep(cancelTimeout)
+		result <- colorstr.Sprintf("[yellow]Timedout (after %s)", cancelTimeout)
+	}()
 
-	p := &localdata.Process{
-		Component:   component,
+	go func() {
+		latestV, _, err := environment.GlobalEnv().V1Repository().LatestStableVersion(component, false, nil)
+		if err != nil {
+			result <- ""
+			return
+		}
+		selectVer, _ := environment.GlobalEnv().SelectInstalledVersion(component, version)
+
+		if semver.Compare(selectVer.String(), latestV.String()) < 0 {
+			result <- colorstr.Sprintf(`
+[yellow]A new version of [bold]%[1]s[reset][yellow] is available:[reset] [red][bold]%[2]s[reset] -> [green][bold]%[3]s[reset]
+
+    To update this component:   [tiup_command]tiup update %[1]s[reset]
+    To update all components:   [tiup_command]tiup update --all[reset]
+`,
+				component, selectVer.String(), latestV.String())
+		} else {
+			result <- ""
+		}
+	}()
+
+	s := <-result
+	mu.Lock()
+	defer mu.Unlock()
+	isCheckFinished = true
+	if len(s) > 0 {
+		fmt.Fprintln(os.Stderr, s)
+	}
+}
+
+// PrepareBinary use given binpath or download from tiup mirror
+func PrepareBinary(component string, version utils.Version, binPath string, force bool) (string, error) {
+	if binPath != "" {
+		tmp, err := filepath.Abs(binPath)
+		if err != nil {
+			return "", errors.Trace(err)
+		}
+		binPath = tmp
+	} else {
+		env := environment.GlobalEnv()
+		ver := version
+		var err error
+
+		if ver.String() == utils.NightlyVersionAlias {
+			if ver, _, err = env.V1Repository().LatestNightlyVersion(component); err != nil {
+				return "", err
+			}
+		}
+
+		needDownload := false
+		if !force {
+			// Use the latest version if user doesn't specify a specific version and
+			// download the latest version if the specific component doesn't be installed
+			// Check whether the specific version exist in local
+			ver, err = env.SelectInstalledVersion(component, ver)
+			needDownload = errors.Cause(err) == environment.ErrInstallFirst
+			if err != nil && !needDownload {
+				return "", err
+			}
+		}
+
+		if needDownload || force {
+			fmt.Fprintf(os.Stderr, "The component `%s` version %s is not installed; downloading from repository.\n", component, ver.String())
+			spec := repository.ComponentSpec{
+				ID:      component,
+				Version: string(ver),
+				Force:   force,
+			}
+			if err := env.V1Repository().UpdateComponents([]repository.ComponentSpec{spec}); err != nil {
+				return "", err
+			}
+		}
+
+		if ver.IsEmpty() {
+			ver, err = env.SelectInstalledVersion(component, ver)
+			if err != nil {
+				return "", err
+			}
+		}
+
+		binPath, err = environment.GlobalEnv().BinaryPath(component, ver)
+		if err != nil {
+			return "", err
+		}
+	}
+	return binPath, nil
+}
+
+func saveProcessInfo(p *PrepareCommandParams, c *exec.Cmd) error {
+	info := &localdata.Process{
+		Component:   p.Component,
 		CreatedTime: time.Now().Format(time.RFC3339),
+		Pid:         c.Process.Pid,
 		Exec:        c.Args[0],
-		Args:        args,
-		Dir:         instanceDir,
+		Args:        environment.HideSensitiveInfo(c.Args),
+		Dir:         p.InstanceDir,
 		Env:         c.Env,
 		Cmd:         c,
 	}
-
-	fmt.Fprintf(os.Stderr, "Starting component `%s`: %s\n", component, strings.Join(append([]string{p.Exec}, p.Args...), " "))
-	err = p.Cmd.Start()
-	if p.Cmd.Process != nil {
-		p.Pid = p.Cmd.Process.Pid
-	}
-	return p, err
+	return environment.GlobalEnv().Profile().WriteMetaFile(info.Dir, info)
 }

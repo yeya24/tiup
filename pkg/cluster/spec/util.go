@@ -14,21 +14,24 @@
 package spec
 
 import (
-	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pingcap/tiup/pkg/utils"
 	"github.com/pingcap/tiup/pkg/version"
-	"github.com/prometheus/common/expfmt"
-	"go.etcd.io/etcd/pkg/transport"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
 )
 
 var tidbSpec *SpecManager
+
+var promRegexp = regexp.MustCompile(`process_start_time_seconds\s+([\d.e+-]+)`)
 
 // GetSpecManager return the spec manager of tidb cluster.
 func GetSpecManager() *SpecManager {
@@ -123,8 +126,12 @@ func LoadClientCert(dir string) (*tls.Config, error) {
 }
 
 // statusByHost queries current status of the instance by http status api.
-func statusByHost(host string, port int, path string, tlsCfg *tls.Config) string {
-	client := utils.NewHTTPClient(statusQueryTimeout, tlsCfg)
+func statusByHost(host string, port int, path string, timeout time.Duration, tlsCfg *tls.Config) string {
+	if timeout < time.Second {
+		timeout = statusQueryTimeout
+	}
+
+	client := utils.NewHTTPClient(timeout, tlsCfg)
 
 	scheme := "http"
 	if tlsCfg != nil {
@@ -133,10 +140,10 @@ func statusByHost(host string, port int, path string, tlsCfg *tls.Config) string
 	if path == "" {
 		path = "/"
 	}
-	url := fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path)
+	url := fmt.Sprintf("%s://%s%s", scheme, utils.JoinHostPort(host, port), path)
 
 	// body doesn't have any status section needed
-	body, err := client.Get(url)
+	body, err := client.Get(context.TODO(), url)
 	if err != nil || body == nil {
 		return "Down"
 	}
@@ -144,40 +151,41 @@ func statusByHost(host string, port int, path string, tlsCfg *tls.Config) string
 }
 
 // UptimeByHost queries current uptime of the instance by http Prometheus metric api.
-func UptimeByHost(host string, port int, tlsCfg *tls.Config) time.Duration {
+func UptimeByHost(host string, port int, timeout time.Duration, tlsCfg *tls.Config, path string) time.Duration {
+	if timeout < time.Second {
+		timeout = statusQueryTimeout
+	}
+
 	scheme := "http"
 	if tlsCfg != nil {
 		scheme = "https"
 	}
-	url := fmt.Sprintf("%s://%s:%d/metrics", scheme, host, port)
+	if path == "" {
+		path = "/metrics"
+	}
+	if path[0] != '/' {
+		path = "/" + path
+	}
+	url := fmt.Sprintf("%s://%s%s", scheme, utils.JoinHostPort(host, port), path)
 
-	client := utils.NewHTTPClient(statusQueryTimeout, tlsCfg)
+	client := utils.NewHTTPClient(timeout, tlsCfg)
 
-	body, err := client.Get(url)
+	body, err := client.Get(context.TODO(), url)
 	if err != nil || body == nil {
 		return 0
 	}
 
-	var parser expfmt.TextParser
-	reader := bytes.NewReader(body)
-	mf, err := parser.TextToMetricFamilies(reader)
+	matches := promRegexp.FindSubmatch(body)
+	if len(matches) != 2 {
+		return 0
+	}
+
+	f, err := strconv.ParseFloat(string(matches[1]), 64)
 	if err != nil {
 		return 0
 	}
 
-	now := time.Now()
-	for k, v := range mf {
-		if k == promMetricStartTimeSeconds {
-			ms := v.GetMetric()
-			if len(ms) >= 1 {
-				startTime := ms[0].Gauge.GetValue()
-				return now.Sub(time.Unix(int64(startTime), 0))
-			}
-			return 0
-		}
-	}
-
-	return 0
+	return time.Since(time.Unix(int64(f), 0))
 }
 
 // Abs returns the absolute path
@@ -194,7 +202,7 @@ func Abs(user, path string) string {
 // MultiDirAbs returns the absolute path for multi-dir separated by comma
 func MultiDirAbs(user, paths string) []string {
 	var dirs []string
-	for _, path := range strings.Split(paths, ",") {
+	for path := range strings.SplitSeq(paths, ",") {
 		path = strings.TrimSpace(path)
 		if path == "" {
 			continue
@@ -208,4 +216,17 @@ func MultiDirAbs(user, paths string) []string {
 func PackagePath(comp string, version string, os string, arch string) string {
 	fileName := fmt.Sprintf("%s-%s-%s-%s.tar.gz", comp, version, os, arch)
 	return ProfilePath(TiUPPackageCacheDir, fileName)
+}
+
+// GetDMMasterPackageName return package name of the first DMMaster instance
+func GetDMMasterPackageName(topo Topology) string {
+	for _, c := range topo.ComponentsByStartOrder() {
+		if c.Name() == ComponentDMMaster {
+			instances := c.Instances()
+			if len(instances) > 0 {
+				return instances[0].ComponentSource()
+			}
+		}
+	}
+	return ComponentDMMaster
 }

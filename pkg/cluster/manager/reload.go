@@ -21,34 +21,49 @@ import (
 	"github.com/fatih/color"
 	"github.com/joomcode/errorx"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cliutil"
 	"github.com/pingcap/tiup/pkg/cluster/clusterutil"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
+	"github.com/pingcap/tiup/pkg/cluster/executor"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
-	"github.com/pingcap/tiup/pkg/logger/log"
+
+	"github.com/pingcap/tiup/pkg/tui"
 )
 
 // Reload the cluster.
-func (m *Manager) Reload(name string, opt operator.Options, skipRestart, skipConfirm bool) error {
+func (m *Manager) Reload(name string, gOpt operator.Options, skipRestart, skipConfirm bool) error {
 	if err := clusterutil.ValidateClusterNameOrError(name); err != nil {
 		return err
 	}
 
-	sshTimeout := opt.SSHTimeout
+	// check locked
+	if err := m.specManager.ScaleOutLockedErr(name); err != nil {
+		return err
+	}
+
+	sshTimeout := gOpt.SSHTimeout
+	exeTimeout := gOpt.OptTimeout
 
 	metadata, err := m.meta(name)
 	if err != nil {
 		return err
 	}
 
+	var sshProxyProps = &tui.SSHConnectionProps{}
+	if gOpt.SSHType != executor.SSHTypeNone && len(gOpt.SSHProxyHost) != 0 {
+		var err error
+		if sshProxyProps, err = tui.ReadIdentityFileOrPassword(gOpt.SSHProxyIdentity, gOpt.SSHProxyUsePassword); err != nil {
+			return err
+		}
+	}
+
 	if !skipConfirm {
-		if err := cliutil.PromptForConfirmOrAbortError(
-			fmt.Sprintf("Will reload the cluster %s with restart policy is %s, nodes: %s, roles: %s.\nDo you want to continue? [y/N]:",
+		if err := tui.PromptForConfirmOrAbortError(
+			"%s", fmt.Sprintf("Will reload the cluster %s with restart policy is %s, nodes: %s, roles: %s.\nDo you want to continue? [y/N]:",
 				color.HiYellowString(name),
 				color.HiRedString(fmt.Sprintf("%v", !skipRestart)),
-				color.HiRedString(strings.Join(opt.Nodes, ",")),
-				color.HiRedString(strings.Join(opt.Roles, ",")),
+				color.HiRedString(strings.Join(gOpt.Nodes, ",")),
+				color.HiRedString(strings.Join(gOpt.Roles, ",")),
 			),
 		); err != nil {
 			return err
@@ -58,62 +73,69 @@ func (m *Manager) Reload(name string, opt operator.Options, skipRestart, skipCon
 	topo := metadata.GetTopology()
 	base := metadata.GetBaseMeta()
 
-	uniqueHosts := make(map[string]hostInfo) // host -> ssh-port, os, arch
-	topo.IterInstance(func(inst spec.Instance) {
-		if _, found := uniqueHosts[inst.GetHost()]; !found {
-			uniqueHosts[inst.GetHost()] = hostInfo{
-				ssh:  inst.GetSSHPort(),
-				os:   inst.OS(),
-				arch: inst.Arch(),
-			}
-		}
-	})
+	// monitor
+	uniqueHosts, noAgentHosts := getMonitorHosts(topo)
 
-	refreshConfigTasks, hasImported := buildRegenConfigTasks(m, name, topo, base, nil, opt.IgnoreConfigCheck)
-	monitorConfigTasks := buildRefreshMonitoredConfigTasks(
+	// init config
+	refreshConfigTasks := buildInitConfigTasks(m, name, topo, base, gOpt, nil)
+
+	monitorConfigTasks := buildInitMonitoredConfigTasks(
 		m.specManager,
 		name,
 		uniqueHosts,
+		noAgentHosts,
 		*topo.BaseTopo().GlobalOptions,
 		topo.GetMonitoredOptions(),
+		m.logger,
 		sshTimeout,
-		opt.SSHType)
+		exeTimeout,
+		gOpt,
+		sshProxyProps,
+	)
 
-	// handle dir scheme changes
-	if hasImported {
-		if err := spec.HandleImportPathMigration(name); err != nil {
-			return err
-		}
+	b, err := m.sshTaskBuilder(name, topo, base.User, gOpt)
+	if err != nil {
+		return err
 	}
-
-	tb := m.sshTaskBuilder(name, topo, base.User, opt)
-	if topo.Type() == spec.TopoTypeTiDB {
-		tb = tb.UpdateTopology(
+	if topo.Type() == spec.TopoTypeTiDB && !skipRestart {
+		b.UpdateTopology(
 			name,
 			m.specManager.Path(name),
 			metadata.(*spec.ClusterMeta),
 			nil, /* deleteNodeIds */
 		)
 	}
-	tb = tb.ParallelStep("+ Refresh instance configs", opt.Force, refreshConfigTasks...)
+	b.ParallelStep("+ Refresh instance configs", gOpt.Force, refreshConfigTasks...)
 
 	if len(monitorConfigTasks) > 0 {
-		tb = tb.ParallelStep("+ Refresh monitor configs", opt.Force, monitorConfigTasks...)
+		b.ParallelStep("+ Refresh monitor configs", gOpt.Force, monitorConfigTasks...)
 	}
 
-	tlsCfg, err := topo.TLSConfig(m.specManager.Path(name, spec.TLSCertKeyDir))
-	if err != nil {
-		return err
-	}
+	// Save the updated topology back to file after configs are refreshed
+	// This ensures any modifications made during InitConfig (like handleRemoteWrite) are persisted
+	b.Func("Save updated topology", func(ctx context.Context) error {
+		// Save metadata back to file
+		return m.specManager.SaveMeta(name, metadata)
+	})
+
 	if !skipRestart {
-		tb = tb.Func("UpgradeCluster", func(ctx context.Context) error {
-			return operator.Upgrade(ctx, topo, opt, tlsCfg)
+		tlsCfg, err := topo.TLSConfig(m.specManager.Path(name, spec.TLSCertKeyDir))
+		if err != nil {
+			return err
+		}
+		b.Func("Upgrade Cluster", func(ctx context.Context) error {
+			return operator.Upgrade(ctx, topo, gOpt, tlsCfg, base.Version, base.Version, nil)
 		})
 	}
 
-	t := tb.Build()
+	t := b.Build()
 
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	ctx := ctxt.New(
+		context.Background(),
+		gOpt.Concurrency,
+		m.logger,
+	)
+	if err := t.Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -121,7 +143,7 @@ func (m *Manager) Reload(name string, opt operator.Options, skipRestart, skipCon
 		return perrs.Trace(err)
 	}
 
-	log.Infof("Reloaded cluster `%s` successfully", name)
+	m.logger.Infof("Reloaded cluster `%s` successfully", name)
 
 	return nil
 }

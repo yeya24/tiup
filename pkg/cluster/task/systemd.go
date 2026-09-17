@@ -28,6 +28,8 @@ type SystemCtl struct {
 	unit         string
 	action       string
 	daemonReload bool
+	checkactive  bool
+	scope        string
 }
 
 // Execute implements the Task interface
@@ -41,6 +43,8 @@ func (c *SystemCtl) Execute(ctx context.Context) error {
 		Unit:         c.unit,
 		Action:       c.action,
 		ReloadDaemon: c.daemonReload,
+		CheckActive:  c.checkactive,
+		Scope:        c.scope,
 	}
 	systemd := module.NewSystemdModule(cfg)
 	stdout, stderr, err := systemd.Execute(ctx, e)

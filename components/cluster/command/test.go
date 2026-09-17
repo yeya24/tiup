@@ -15,13 +15,14 @@ package command
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 
 	perrs "github.com/pingcap/errors"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/proxy"
+	"github.com/pingcap/tiup/pkg/utils"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 
@@ -55,11 +56,12 @@ func newTestCmd() *cobra.Command {
 				return err
 			}
 
+			tcpProxy := proxy.GetTCPProxy()
 			switch args[1] {
 			case "writable":
-				return writable(metadata.Topology)
+				return writable(metadata.Topology, tcpProxy)
 			case "data":
-				return data(metadata.Topology)
+				return data(metadata.Topology, tcpProxy)
 			default:
 				fmt.Println("unknown command: ", args[1])
 				return cmd.Help()
@@ -70,21 +72,19 @@ func newTestCmd() *cobra.Command {
 	return cmd
 }
 
-func createDB(spec spec.TiDBSpec) (db *sql.DB, err error) {
-	dsn := fmt.Sprintf("root:@tcp(%s:%d)/?charset=utf8mb4,utf8&multiStatements=true", spec.Host, spec.Port)
-	db, err = sql.Open("mysql", dsn)
-
-	return
-}
-
 // To check if test.ti_cluster has data
-func data(topo *spec.Specification) error {
+func data(topo *spec.Specification, tcpProxy *proxy.TCPProxy) error {
 	errg, _ := errgroup.WithContext(context.Background())
 
 	for _, spec := range topo.TiDBServers {
-		specVal := *spec
+		endpoint := utils.JoinHostPort(spec.Host, spec.Port)
 		errg.Go(func() error {
-			db, err := createDB(specVal)
+			if tcpProxy != nil {
+				closeC := tcpProxy.Run([]string{endpoint})
+				defer tcpProxy.Close(closeC)
+				endpoint = tcpProxy.GetEndpoints()[0]
+			}
+			db, err := createDB(endpoint)
 			if err != nil {
 				return err
 			}
@@ -99,7 +99,7 @@ func data(topo *spec.Specification) error {
 				return errors.New("table test.ti_cluster is empty")
 			}
 
-			fmt.Printf("check data %s:%d success\n", specVal.Host, specVal.Port)
+			fmt.Printf("check data %s success\n", utils.JoinHostPort(spec.Host, spec.Port))
 			return nil
 		})
 	}
@@ -107,13 +107,18 @@ func data(topo *spec.Specification) error {
 	return errg.Wait()
 }
 
-func writable(topo *spec.Specification) error {
+func writable(topo *spec.Specification, tcpProxy *proxy.TCPProxy) error {
 	errg, _ := errgroup.WithContext(context.Background())
 
 	for _, spec := range topo.TiDBServers {
-		specVal := *spec
+		endpoint := utils.JoinHostPort(spec.Host, spec.Port)
 		errg.Go(func() error {
-			db, err := createDB(specVal)
+			if tcpProxy != nil {
+				closeC := tcpProxy.Run([]string{endpoint})
+				defer tcpProxy.Close(closeC)
+				endpoint = tcpProxy.GetEndpoints()[0]
+			}
+			db, err := createDB(endpoint)
 			if err != nil {
 				return err
 			}
@@ -128,7 +133,7 @@ func writable(topo *spec.Specification) error {
 				return err
 			}
 
-			fmt.Printf("write %s:%d success\n", specVal.Host, specVal.Port)
+			fmt.Printf("write %s success\n", utils.JoinHostPort(spec.Host, spec.Port))
 			return nil
 		})
 	}

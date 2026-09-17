@@ -7,7 +7,7 @@ server_configs:
     binlog.enable: true
     binlog.ignore-error: false
   tikv:
-    storage.reserve-space: 1K
+    storage.reserve-space: 5M
   pump:
     storage.stop-write-at-available-space: 1 mib
 
@@ -41,16 +41,13 @@ drainer_servers:
     config:
       syncer.db-type: "file"
 
+tiproxy_servers:
+  - host: n1
+
 cdc_servers:
   - host: n3
   - host: n4
   - host: n5
-
-tispark_masters:
-  - host: n3
-
-tispark_workers:
-  - host: n4
 
 monitoring_servers:
   - host: n1

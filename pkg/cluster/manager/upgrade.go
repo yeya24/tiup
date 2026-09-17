@@ -17,27 +17,52 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/joomcode/errorx"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cliutil"
 	"github.com/pingcap/tiup/pkg/cluster/clusterutil"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
+	"github.com/pingcap/tiup/pkg/cluster/executor"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
 	"github.com/pingcap/tiup/pkg/environment"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/meta"
 	"github.com/pingcap/tiup/pkg/repository"
+	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/tui"
 	"github.com/pingcap/tiup/pkg/utils"
 	"golang.org/x/mod/semver"
 )
 
-// Upgrade the cluster.
-func (m *Manager) Upgrade(name string, clusterVersion string, opt operator.Options, skipConfirm, offline bool) error {
+func (m *Manager) upgradePrecheck(name string, componentVersions map[string]string, opt operator.Options, skipConfirm bool) error {
+	if !skipConfirm && strings.ToLower(opt.DisplayMode) != "json" {
+		for _, v := range componentVersions {
+			if v != "" {
+				m.logger.Warnf("%s", color.YellowString("tiup-cluster does not provide compatibility guarantees or version checks for different component versions. Please be aware of the risks or use it with the assistance of PingCAP support."))
+				err := tui.PromptForConfirmOrAbortError("Do you want to continue? [y/N]: ")
+				if err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
 	if err := clusterutil.ValidateClusterNameOrError(name); err != nil {
+		return err
+	}
+
+	// check locked
+	return m.specManager.ScaleOutLockedErr(name)
+}
+
+// Upgrade the cluster.
+func (m *Manager) Upgrade(name string, clusterVersion string, componentVersions map[string]string, opt operator.Options, skipConfirm, offline, ignoreVersionCheck bool, restartTimeout time.Duration) error {
+	err := m.upgradePrecheck(name, componentVersions, opt, skipConfirm)
+	if err != nil {
 		return err
 	}
 
@@ -49,6 +74,11 @@ func (m *Manager) Upgrade(name string, clusterVersion string, opt operator.Optio
 	topo := metadata.GetTopology()
 	base := metadata.GetBaseMeta()
 
+	// Adjust topo by new version
+	if clusterTopo, ok := topo.(*spec.Specification); ok {
+		clusterTopo.AdjustByVersion(clusterVersion)
+	}
+
 	var (
 		downloadCompTasks []task.Task // tasks which are used to download components
 		copyCompTasks     []task.Task // tasks which are used to copy components to remote host
@@ -57,33 +87,70 @@ func (m *Manager) Upgrade(name string, clusterVersion string, opt operator.Optio
 	)
 
 	if err := versionCompare(base.Version, clusterVersion); err != nil {
-		return err
-	}
-
-	if !skipConfirm {
-		if err := cliutil.PromptForConfirmOrAbortError(
-			"This operation will upgrade %s %s cluster %s to %s.\nDo you want to continue? [y/N]:",
-			m.sysName,
-			color.HiYellowString(base.Version),
-			color.HiYellowString(name),
-			color.HiYellowString(clusterVersion)); err != nil {
+		if !ignoreVersionCheck {
 			return err
 		}
-		log.Infof("Upgrading cluster...")
+		m.logger.Warnf("%s", color.RedString("There is no guarantee that the cluster can be downgraded. Be careful before you continue."))
 	}
 
-	hasImported := false
-	for _, comp := range topo.ComponentsByUpdateOrder() {
-		for _, inst := range comp.Instances() {
-			compName := inst.ComponentName()
-			version := m.bindVersion(inst.ComponentName(), clusterVersion)
+	var compVersionMsg strings.Builder
+	restartComponents := []string{}
+	components := topo.ComponentsByUpdateOrder(base.Version)
+	for _, comp := range components {
+		// if component version is not specified, use the cluster version or latest("")
+		oldver := comp.CalculateVersion(base.Version)
+		version := componentVersions[comp.Name()]
+		if version != "" {
+			comp.SetVersion(version)
+		}
+		calver := comp.CalculateVersion(clusterVersion)
+		if comp.Name() != spec.ComponentTiProxy || calver != oldver {
+			restartComponents = append(restartComponents, comp.Name(), comp.Role())
+			if len(comp.Instances()) > 0 {
+				compVersionMsg.WriteString(fmt.Sprintf("\nwill upgrade and restart component \"%19s\" to \"%s\",", comp.Name(), calver))
+			}
+		}
+	}
+	components = operator.FilterComponent(components, set.NewStringSet(restartComponents...))
 
+	monitoredOptions := topo.GetMonitoredOptions()
+	if monitoredOptions != nil {
+		if componentVersions[spec.ComponentBlackboxExporter] != "" {
+			monitoredOptions.BlackboxExporterVersion = componentVersions[spec.ComponentBlackboxExporter]
+		}
+		if componentVersions[spec.ComponentNodeExporter] != "" {
+			monitoredOptions.NodeExporterVersion = componentVersions[spec.ComponentNodeExporter]
+		}
+		compVersionMsg.WriteString(fmt.Sprintf("\nwill upgrade component %19s to \"%s\",", "\"node-exporter\"", monitoredOptions.NodeExporterVersion))
+		compVersionMsg.WriteString(fmt.Sprintf("\nwill upgrade component %19s to \"%s\".", "\"blackbox-exporter\"", monitoredOptions.BlackboxExporterVersion))
+	}
+
+	m.logger.Warnf(`%s
+This operation will upgrade %s %s cluster %s (with a concurrency of %d) to %s:%s`,
+		color.YellowString("Before the upgrade, it is recommended to read the upgrade guide at https://docs.pingcap.com/tidb/stable/upgrade-tidb-using-tiup and finish the preparation steps."),
+		m.sysName,
+		color.HiYellowString(base.Version),
+		color.HiYellowString(name),
+		opt.Concurrency,
+		color.HiYellowString(clusterVersion),
+		compVersionMsg.String())
+	if !skipConfirm {
+		if err := tui.PromptForConfirmOrAbortError(`Do you want to continue? [y/N]:`); err != nil {
+			return err
+		}
+		m.logger.Infof("Upgrading cluster...")
+	}
+
+	for _, comp := range components {
+		version := comp.CalculateVersion(clusterVersion)
+
+		for _, inst := range comp.Instances() {
 			// Download component from repository
-			key := fmt.Sprintf("%s-%s-%s-%s", compName, version, inst.OS(), inst.Arch())
+			key := fmt.Sprintf("%s-%s-%s-%s", inst.ComponentSource(), version, inst.OS(), inst.Arch())
 			if _, found := uniqueComps[key]; !found {
 				uniqueComps[key] = struct{}{}
-				t := task.NewBuilder().
-					Download(inst.ComponentName(), inst.OS(), inst.Arch(), version).
+				t := task.NewBuilder(m.logger).
+					Download(inst.ComponentSource(), inst.OS(), inst.Arch(), version).
 					Build()
 				downloadCompTasks = append(downloadCompTasks, t)
 			}
@@ -95,26 +162,16 @@ func (m *Manager) Upgrade(name string, clusterVersion string, opt operator.Optio
 			logDir := spec.Abs(base.User, inst.LogDir())
 
 			// Deploy component
-			tb := task.NewBuilder()
-			if inst.IsImported() {
-				switch inst.ComponentName() {
-				case spec.ComponentPrometheus, spec.ComponentGrafana, spec.ComponentAlertmanager:
-					tb.CopyComponent(
-						inst.ComponentName(),
-						inst.OS(),
-						inst.Arch(),
-						version,
-						"", // use default srcPath
-						inst.GetHost(),
-						deployDir,
-					)
-				}
-				hasImported = true
-			}
+			tb := task.NewBuilder(m.logger)
+
+			// for some component, dataDirs might need to be created due to upgrade
+			// eg: TiCDC support DataDir since v4.0.13
+			tb = tb.Mkdir(topo.BaseTopo().GlobalOptions.User, inst.GetManageHost(), topo.BaseTopo().GlobalOptions.SystemdMode != spec.UserMode, dataDirs...)
 
 			// backup files of the old version
-			tb = tb.BackupComponent(inst.ComponentName(), base.Version, inst.GetHost(), deployDir)
+			tb = tb.BackupComponent(inst.ComponentSource(), base.Version, inst.GetManageHost(), deployDir)
 
+			// this interface is not used
 			if deployerInstance, ok := inst.(DeployerInstance); ok {
 				deployerInstance.Deploy(tb, "", deployDir, version, name, clusterVersion)
 			} else {
@@ -125,19 +182,19 @@ func (m *Manager) Upgrade(name string, clusterVersion string, opt operator.Optio
 					sparkVer, _, err := env.V1Repository().WithOptions(repository.Options{
 						GOOS:   inst.OS(),
 						GOARCH: inst.Arch(),
-					}).LatestStableVersion(spec.ComponentSpark, false)
+					}).LatestStableVersion(spec.ComponentSpark, false, nil)
 					if err != nil {
 						return err
 					}
 					tb = tb.DeploySpark(inst, sparkVer.String(), "" /* default srcPath */, deployDir)
 				default:
 					tb = tb.CopyComponent(
-						inst.ComponentName(),
+						inst.ComponentSource(),
 						inst.OS(),
 						inst.Arch(),
 						version,
 						"", // use default srcPath
-						inst.GetHost(),
+						inst.GetManageHost(),
 						deployDir,
 					)
 				}
@@ -161,29 +218,109 @@ func (m *Manager) Upgrade(name string, clusterVersion string, opt operator.Optio
 		}
 	}
 
-	// handle dir scheme changes
-	if hasImported {
-		if err := spec.HandleImportPathMigration(name); err != nil {
-			return err
+	var sshProxyProps = &tui.SSHConnectionProps{}
+	if opt.SSHType != executor.SSHTypeNone {
+		var err error
+		if len(opt.SSHProxyHost) != 0 {
+			if sshProxyProps, err = tui.ReadIdentityFileOrPassword(opt.SSHProxyIdentity, opt.SSHProxyUsePassword); err != nil {
+				return err
+			}
 		}
 	}
 
+	uniqueHosts, noAgentHosts := getMonitorHosts(topo)
+	// Deploy monitor relevant components to remote
+	dlTasks, dpTasks, err := buildMonitoredDeployTask(
+		m,
+		uniqueHosts,
+		noAgentHosts,
+		topo.BaseTopo().GlobalOptions,
+		monitoredOptions,
+		opt,
+		sshProxyProps,
+	)
+	if err != nil {
+		return err
+	}
+
+	monitorConfigTasks := buildInitMonitoredConfigTasks(
+		m.specManager,
+		name,
+		uniqueHosts,
+		noAgentHosts,
+		*topo.BaseTopo().GlobalOptions,
+		monitoredOptions,
+		m.logger,
+		opt.SSHTimeout,
+		opt.OptTimeout,
+		opt,
+		sshProxyProps,
+	)
+
+	ctx := ctxt.New(
+		context.Background(),
+		opt.Concurrency,
+		m.logger,
+	)
 	tlsCfg, err := topo.TLSConfig(m.specManager.Path(name, spec.TLSCertKeyDir))
 	if err != nil {
 		return err
 	}
-	t := m.sshTaskBuilder(name, topo, base.User, opt).
+
+	// make sure the cluster is stopped
+	if offline && !opt.Force {
+		running := false
+		topo.IterInstance(func(ins spec.Instance) {
+			if !running {
+				status := ins.Status(ctx, time.Duration(opt.APITimeout), tlsCfg, topo.BaseTopo().MasterList...)
+				if strings.HasPrefix(status, "Up") || strings.HasPrefix(status, "Healthy") {
+					running = true
+				}
+			}
+		}, opt.Concurrency)
+
+		if running {
+			return perrs.Errorf("cluster is running and cannot be upgraded offline")
+		}
+	}
+
+	b, err := m.sshTaskBuilder(name, topo, base.User, opt)
+	if err != nil {
+		return err
+	}
+	t := b.
 		Parallel(false, downloadCompTasks...).
+		ParallelStep("download monitored", false, dlTasks...).
 		Parallel(opt.Force, copyCompTasks...).
+		ParallelStep("deploy monitored", false, dpTasks...).
+		ParallelStep("refresh monitored config", false, monitorConfigTasks...).
 		Func("UpgradeCluster", func(ctx context.Context) error {
 			if offline {
 				return nil
 			}
-			return operator.Upgrade(ctx, topo, opt, tlsCfg)
+			nopt := opt
+			nopt.Roles = restartComponents
+			waitFunc := func() {}
+			if restartTimeout.Nanoseconds() > 0 {
+				waitFunc = func() {
+					// A tui.PromptWithTimeout(str, time.Duration) would have been nice
+					ch := make(chan any, 1)
+					go func() {
+						tui.Prompt(fmt.Sprintf("\nPress any key to continue (timeout %s)", restartTimeout))
+						ch <- nil
+					}()
+					select {
+					case <-time.After(restartTimeout):
+						fmt.Printf("\nTimeout, continuing\n")
+					case <-ch:
+					}
+				}
+			}
+			return operator.Upgrade(ctx, topo, nopt, tlsCfg, base.Version, clusterVersion, waitFunc)
 		}).
 		Build()
 
-	if err := t.Execute(ctxt.New(context.Background())); err != nil {
+	if err := t.Execute(ctx); err != nil {
 		if errorx.Cast(err) != nil {
 			// FIXME: Map possible task errors and give suggestions.
 			return err
@@ -207,7 +344,7 @@ func (m *Manager) Upgrade(name string, clusterVersion string, opt operator.Optio
 		return err
 	}
 
-	log.Infof("Upgraded cluster `%s` successfully", name)
+	m.logger.Infof("Upgraded cluster `%s` successfully", name)
 
 	return nil
 }
@@ -219,10 +356,10 @@ func versionCompare(curVersion, newVersion string) error {
 	}
 
 	switch semver.Compare(curVersion, newVersion) {
-	case -1:
+	case -1, 0:
 		return nil
-	case 0, 1:
-		return perrs.Errorf("please specify a higher version than %s", curVersion)
+	case 1:
+		return perrs.Errorf("please specify a higher or equle version than %s", curVersion)
 	default:
 		return perrs.Errorf("unreachable")
 	}

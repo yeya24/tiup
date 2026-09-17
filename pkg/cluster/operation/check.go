@@ -23,11 +23,12 @@ import (
 	"strings"
 
 	"github.com/AstroProfundis/sysinfo"
-	"github.com/pingcap/tidb-insight/collector/insight"
+	"github.com/pingcap/tiup/pkg/checkpoint"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
 	"github.com/pingcap/tiup/pkg/cluster/module"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
-	"github.com/pingcap/tiup/pkg/logger/log"
+	"github.com/pingcap/tiup/pkg/insight"
+	"go.uber.org/zap"
 )
 
 // CheckOptions control the list of checks to be performed
@@ -45,6 +46,7 @@ type CheckOptions struct {
 var (
 	CheckNameGeneral       = "general" // errors that don't fit any specific check
 	CheckNameNTP           = "ntp"
+	CheckNameChrony        = "chrony"
 	CheckNameOSVer         = "os-version"
 	CheckNameSwap          = "swap"
 	CheckNameSysctl        = "sysctl"
@@ -57,11 +59,14 @@ var (
 	CheckNameNet           = "network"
 	CheckNameLimits        = "limits"
 	CheckNameSysService    = "service"
-	CheckNameSELinux       = "selinux"
+	CheckNameSELinuxConf   = "selinux_conf"
+	CheckNameSELinuxStatus = "selinux_status"
 	CheckNameCommand       = "command"
 	CheckNameFio           = "fio"
 	CheckNameTHP           = "thp"
 	CheckNameDirPermission = "permission"
+	CheckNameDirExist      = "exist"
+	CheckNameTimeZone      = "timezone"
 )
 
 // CheckResult is the result of a check
@@ -100,7 +105,7 @@ func (c CheckResult) Passed() bool {
 // CheckSystemInfo performs checks with basic system info
 func CheckSystemInfo(opt *CheckOptions, rawData []byte) []*CheckResult {
 	var results []*CheckResult
-	var insightInfo insight.InsightInfo
+	var insightInfo insight.Info
 	if err := json.Unmarshal(rawData, &insightInfo); err != nil {
 		return append(results, &CheckResult{
 			Name: CheckNameGeneral,
@@ -111,8 +116,21 @@ func CheckSystemInfo(opt *CheckOptions, rawData []byte) []*CheckResult {
 	// check basic system info
 	results = append(results, checkSysInfo(opt, &insightInfo.SysInfo)...)
 
-	// check NTP sync status
-	results = append(results, checkNTP(&insightInfo.NTP))
+	// check time sync status
+	switch {
+	case insightInfo.ChronyStat.LeapStatus != "none":
+		results = append(results, checkChrony(&insightInfo.ChronyStat))
+	case insightInfo.NTP.Status != "none":
+		results = append(results, checkNTP(&insightInfo.NTP))
+	default:
+		results = append(results,
+			&CheckResult{
+				Name: CheckNameNTP,
+				Err:  fmt.Errorf("the NTPd daemon or Chronyd daemon may be not installed"),
+				Warn: true,
+			},
+		)
+	}
 
 	epollResult := &CheckResult{
 		Name: CheckNameEpoll,
@@ -142,6 +160,11 @@ func checkSysInfo(opt *CheckOptions, sysInfo *sysinfo.SysInfo) []*CheckResult {
 	return results
 }
 
+// Try to keep this in sync with
+// https://docs.pingcap.com/tidb/stable/hardware-and-software-requirements#os-and-platform-requirements
+//
+// This information is in most cases based on the `ID` (Vendor) and `VERSION_ID` (Release) of /etc/os-release
+// See https://github.com/AstroProfundis/sysinfo/blob/tiup/os.go for details.
 func checkOSInfo(opt *CheckOptions, osInfo *sysinfo.OS) *CheckResult {
 	result := &CheckResult{
 		Name: CheckNameOSVer,
@@ -150,17 +173,75 @@ func checkOSInfo(opt *CheckOptions, osInfo *sysinfo.OS) *CheckResult {
 
 	// check OS vendor
 	switch osInfo.Vendor {
-	case "centos", "redhat":
-		// check version
-		if ver, _ := strconv.Atoi(osInfo.Version); ver < 7 {
-			result.Err = fmt.Errorf("%s %s not supported, use version 7 or higher",
+	case "kylin":
+		// VERSION_ID="V10"
+		if compareVersion(strings.Trim(osInfo.Version, "V"), "10") < 0 {
+			result.Err = fmt.Errorf("%s %s not supported, use version V10 or higher",
 				osInfo.Name, osInfo.Release)
 			return result
 		}
-	case "debian", "ubuntu":
-		// check version
+	case "amzn":
+		// https://aws.amazon.com/linux/amazon-linux-2023/
+		if osInfo.Version == "2023" {
+			return result
+		}
+
+		// Amazon Linux 2 is based on CentOS 7 and is recommended for
+		// AWS Graviton 2 (ARM64) deployments.
+		// https://aws.amazon.com/amazon-linux-2/
+		if compareVersion(osInfo.Version, "2") < 0 || compareVersion(osInfo.Version, "3") >= 0 {
+			result.Err = fmt.Errorf("%s %s not supported, use Amazon Linux 2 or Amazon Linux 2023 please",
+				osInfo.Name, osInfo.Release)
+			return result
+		}
+	case "centos":
+		// CentOS Linux is EOL
+		// CentOS Stream 9 and newer is still fine
+		if compareVersion(osInfo.Version, "9") < 0 {
+			result.Err = fmt.Errorf("%s %s not supported, use version 9 or higher",
+				osInfo.Name, osInfo.Release)
+			return result
+		}
+	case "redhat", "rhel", "ol":
+		// RHEL 8.4 or newer 8.x versions are supported
+		if compareVersion(osInfo.Version, "8.4") < 0 || compareVersion(osInfo.Version, "10") >= 0 {
+			result.Err = fmt.Errorf("%s %s not supported, use version 8.x or 9.x version please",
+				osInfo.Name, osInfo.Release)
+			return result
+		}
+	case "rocky":
+		// Rocky Linux
+		if compareVersion(osInfo.Version, "9.1") < 0 {
+			result.Err = fmt.Errorf("%s %s not supported, use version 9.1 or later please",
+				osInfo.Name, osInfo.Release)
+			return result
+		}
+	case "debian":
+		// debian support is not fully tested, but we suppose it should work
+		msg := "Debian support is not fully tested, be careful"
+		result.Err = fmt.Errorf("%s (%s)", result.Msg, msg)
+		result.Warn = true
+		if compareVersion(osInfo.Version, "10") < 0 {
+			result.Err = fmt.Errorf("%s %s not supported, use version 10 or higher (%s)",
+				osInfo.Name, osInfo.Release, msg)
+			result.Warn = false
+			return result
+		}
+	case "ubuntu":
+		// ubuntu support is not fully tested, but we suppose it should work
+		msg := "Ubuntu support is not fully tested, be careful"
+		result.Err = fmt.Errorf("%s (%s)", result.Msg, msg)
+		result.Warn = true
+		if compareVersion(osInfo.Version, "20.04") < 0 {
+			result.Err = fmt.Errorf("%s %s not supported, use version 20.04 or higher (%s)",
+				osInfo.Name, osInfo.Release, msg)
+			result.Warn = false
+			return result
+		}
+	case "openEuler":
+		return result
 	default:
-		result.Err = fmt.Errorf("os vendor %s not supported", osInfo.Vendor)
+		result.Err = fmt.Errorf("OS vendor %s not supported", osInfo.Vendor)
 		return result
 	}
 
@@ -175,15 +256,37 @@ func checkNTP(ntpInfo *insight.TimeStat) *CheckResult {
 	}
 
 	if ntpInfo.Status == "none" {
-		log.Infof("The NTPd daemon may be not installed, skip.")
+		zap.L().Info("The NTPd daemon may be not installed, skip.")
+		return result
+	}
+
+	if ntpInfo.Sync == "none" {
+		result.Err = fmt.Errorf("the NTPd daemon may be not start")
+		result.Warn = true
 		return result
 	}
 
 	// check if time offset greater than +- 500ms
 	if math.Abs(ntpInfo.Offset) >= 500 {
-		result.Err = fmt.Errorf("time offet %fms too high", ntpInfo.Offset)
+		result.Err = fmt.Errorf("time offset %fms too high", ntpInfo.Offset)
+	}
+	return result
+}
+
+func checkChrony(chronyInfo *insight.ChronyStat) *CheckResult {
+	result := &CheckResult{
+		Name: CheckNameChrony,
 	}
 
+	if chronyInfo.LeapStatus == "none" {
+		zap.L().Info("The Chrony daemon may be not installed, skip.")
+		return result
+	}
+
+	// check if time offset greater than +- 500ms
+	if math.Abs(chronyInfo.LastOffset) >= 500 {
+		result.Err = fmt.Errorf("time offset %fms too high", chronyInfo.LastOffset)
+	}
 	return result
 }
 
@@ -202,10 +305,23 @@ func checkCPU(opt *CheckOptions, cpuInfo *sysinfo.CPU) []*CheckResult {
 	}
 
 	// check for CPU frequency governor
-	if cpuInfo.Governor != "" && cpuInfo.Governor != "performance" {
+	if cpuInfo.Governor != "" {
+		if cpuInfo.Governor != "performance" {
+			results = append(results, &CheckResult{
+				Name: CheckNameCPUGovernor,
+				Err:  fmt.Errorf("CPU frequency governor is %s, should use performance", cpuInfo.Governor),
+			})
+		} else {
+			results = append(results, &CheckResult{
+				Name: CheckNameCPUGovernor,
+				Msg:  fmt.Sprintf("CPU frequency governor is %s", cpuInfo.Governor),
+			})
+		}
+	} else {
 		results = append(results, &CheckResult{
 			Name: CheckNameCPUGovernor,
-			Err:  fmt.Errorf("CPU frequency governor is %s, should use performance", cpuInfo.Governor),
+			Err:  fmt.Errorf("unable to determine current CPU frequency governor policy"),
+			Warn: true,
 		})
 	}
 
@@ -217,6 +333,7 @@ func checkMem(opt *CheckOptions, memInfo *sysinfo.Memory) []*CheckResult {
 	if memInfo.Swap > 0 {
 		results = append(results, &CheckResult{
 			Name: CheckNameSwap,
+			Warn: true,
 			Err:  fmt.Errorf("swap is enabled, please disable it for best performance"),
 		})
 	}
@@ -270,7 +387,7 @@ func CheckSysLimits(opt *CheckOptions, user string, l []byte) []*CheckResult {
 		nofileHard int
 	)
 
-	for _, line := range strings.Split(string(l), "\n") {
+	for line := range strings.SplitSeq(string(l), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "#") {
 			continue
@@ -331,7 +448,7 @@ func CheckSysLimits(opt *CheckOptions, user string, l []byte) []*CheckResult {
 func CheckKernelParameters(opt *CheckOptions, p []byte) []*CheckResult {
 	var results []*CheckResult
 
-	for _, line := range strings.Split(string(p), "\n") {
+	for line := range strings.SplitSeq(string(p), "\n") {
 		line = strings.TrimSpace(line)
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
@@ -353,7 +470,7 @@ func CheckKernelParameters(opt *CheckOptions, p []byte) []*CheckResult {
 			if val < 32768 {
 				results = append(results, &CheckResult{
 					Name: CheckNameSysctl,
-					Err:  fmt.Errorf("net.core.somaxconn = %d, should be greater than 32768", val),
+					Err:  fmt.Errorf("net.core.somaxconn = %d, should 32768 or greater", val),
 					Msg:  "net.core.somaxconn = 32768",
 				})
 			}
@@ -407,7 +524,7 @@ func CheckKernelParameters(opt *CheckOptions, p []byte) []*CheckResult {
 }
 
 // CheckServices checks if a service is running on the host
-func CheckServices(ctx context.Context, e ctxt.Executor, host, service string, disable bool) *CheckResult {
+func CheckServices(ctx context.Context, e ctxt.Executor, host, service string, disable bool, systemdMode spec.SystemdMode) *CheckResult {
 	result := &CheckResult{
 		Name: CheckNameSysService,
 	}
@@ -417,7 +534,7 @@ func CheckServices(ctx context.Context, e ctxt.Executor, host, service string, d
 		ctx,
 		fmt.Sprintf(
 			"systemctl list-unit-files --type service | grep -i %s.service | wc -l", service),
-		true)
+		systemdMode != spec.UserMode)
 	if err != nil {
 		result.Err = err
 		return result
@@ -429,20 +546,20 @@ func CheckServices(ctx context.Context, e ctxt.Executor, host, service string, d
 		result.Msg = fmt.Sprintf("service %s not found, ignore", service)
 		return result
 	}
-
-	active, err := GetServiceStatus(ctx, e, service+".service")
+	// The service checked here needs to use systemctl in system mode, so the value passed by scope is empty.
+	active, _, _, err := GetServiceStatus(ctx, e, service+".service", "", string(systemdMode))
 	if err != nil {
 		result.Err = err
 	}
 
 	switch disable {
 	case false:
-		if !strings.Contains(active, "running") {
+		if active != "active" {
 			result.Err = fmt.Errorf("service %s is not running", service)
 			result.Msg = fmt.Sprintf("start %s.service", service)
 		}
 	case true:
-		if strings.Contains(active, "running") {
+		if active == "active" {
 			result.Err = fmt.Errorf("service %s is running but should be stopped", service)
 			result.Msg = fmt.Sprintf("stop %s.service", service)
 		}
@@ -451,15 +568,15 @@ func CheckServices(ctx context.Context, e ctxt.Executor, host, service string, d
 	return result
 }
 
-// CheckSELinux checks if SELinux is enabled on the host
-func CheckSELinux(ctx context.Context, e ctxt.Executor) *CheckResult {
+// CheckSELinuxConf checks if SELinux is enabled on the host
+func CheckSELinuxConf(ctx context.Context, e ctxt.Executor, sudo bool) *CheckResult {
 	result := &CheckResult{
-		Name: CheckNameSELinux,
+		Name: CheckNameSELinuxConf,
 	}
 	m := module.NewShellModule(module.ShellModuleConfig{
 		// ignore grep errors, the file may not exist for some systems
 		Command: "grep -E '^\\s*SELINUX=enforcing' /etc/selinux/config 2>/dev/null | wc -l",
-		Sudo:    true,
+		Sudo:    sudo,
 	})
 	stdout, stderr, err := m.Execute(ctx, e)
 	if err != nil {
@@ -467,10 +584,41 @@ func CheckSELinux(ctx context.Context, e ctxt.Executor) *CheckResult {
 		return result
 	}
 	out := strings.Trim(string(stdout), "\n")
-	if lines, err := strconv.Atoi(out); err != nil || lines > 0 {
-		result.Err = fmt.Errorf("SELinux is not disabled, %d %s", lines, err)
-	} else {
-		result.Msg = "SELinux is disabled"
+	lines, err := strconv.Atoi(out)
+	if err != nil {
+		result.Err = fmt.Errorf("can not check SELinux status, please validate manually, %s", err)
+		result.Warn = true
+		return result
+	}
+
+	if lines > 0 {
+		result.Err = fmt.Errorf("SELinux is not configured to be disabled")
+		return result
+	}
+	result.Msg = "SELinux is disabled in configuration"
+	return result
+}
+
+// CheckSELinuxStatus checks if SELinux is enabled on the host
+func CheckSELinuxStatus(ctx context.Context, e ctxt.Executor, sudo bool) *CheckResult {
+	result := &CheckResult{
+		Name: CheckNameSELinuxStatus,
+	}
+	m := module.NewShellModule(module.ShellModuleConfig{
+		Command: "getenforce",
+		Sudo:    sudo,
+	})
+	stdout, stderr, err := m.Execute(ctx, e)
+	if err != nil {
+		result.Err = fmt.Errorf("%w %s", err, stderr)
+		return result
+	}
+	out := strings.Trim(string(stdout), "\n")
+	if out == "Enforcing" {
+		result.Err = fmt.Errorf("SELinux is in Enforcing mode, Update the configuration and reboot")
+	} else if out == "Permissive" {
+		result.Err = fmt.Errorf("SELinux is in Permissive mode, disabling is recommended")
+		result.Warn = true
 	}
 	return result
 }
@@ -481,7 +629,7 @@ func CheckListeningPort(opt *CheckOptions, host string, topo *spec.Specification
 	ports := make(map[int]struct{})
 
 	topo.IterInstance(func(inst spec.Instance) {
-		if inst.GetHost() != host {
+		if inst.GetManageHost() != host {
 			return
 		}
 		for _, up := range inst.UsedPorts() {
@@ -492,7 +640,7 @@ func CheckListeningPort(opt *CheckOptions, host string, topo *spec.Specification
 	})
 
 	for p := range ports {
-		for _, line := range strings.Split(string(rawData), "\n") {
+		for line := range strings.SplitSeq(string(rawData), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) < 5 || fields[0] != "LISTEN" {
 				continue
@@ -514,7 +662,7 @@ func CheckListeningPort(opt *CheckOptions, host string, topo *spec.Specification
 // CheckPartitions checks partition info of data directories
 func CheckPartitions(opt *CheckOptions, host string, topo *spec.Specification, rawData []byte) []*CheckResult {
 	var results []*CheckResult
-	var insightInfo insight.InsightInfo
+	var insightInfo insight.Info
 	if err := json.Unmarshal(rawData, &insightInfo); err != nil {
 		return append(results, &CheckResult{
 			Name: CheckNameDisks,
@@ -525,7 +673,7 @@ func CheckPartitions(opt *CheckOptions, host string, topo *spec.Specification, r
 	flt := flatPartitions(insightInfo.Partitions)
 	parts := sortPartitions(flt)
 
-	// check if multiple instances are using the same partition as data storeage
+	// check if multiple instances are using the same partition as data storage
 	type storePartitionInfo struct {
 		comp string
 		path string
@@ -533,7 +681,7 @@ func CheckPartitions(opt *CheckOptions, host string, topo *spec.Specification, r
 	uniqueStores := make(map[string][]storePartitionInfo) // host+partition -> info
 
 	topo.IterInstance(func(inst spec.Instance) {
-		if inst.GetHost() != host {
+		if inst.GetManageHost() != host {
 			return
 		}
 		for _, dataDir := range spec.MultiDirAbs(topo.GlobalOptions.User, inst.DataDir()) {
@@ -644,15 +792,15 @@ func CheckFIOResult(rr, rw, lat []byte) []*CheckResult {
 	var results []*CheckResult
 
 	// check results for rand read test
-	var rrRes map[string]interface{}
+	var rrRes map[string]any
 	if err := json.Unmarshal(rr, &rrRes); err != nil {
 		results = append(results, &CheckResult{
 			Name: CheckNameFio,
 			Err:  fmt.Errorf("error parsing result of random read test, %s", err),
 		})
 	} else if jobs, ok := rrRes["jobs"]; ok {
-		readRes := jobs.([]interface{})[0].(map[string]interface{})["read"]
-		readIOPS := readRes.(map[string]interface{})["iops"]
+		readRes := jobs.([]any)[0].(map[string]any)["read"]
+		readIOPS := readRes.(map[string]any)["iops"]
 
 		results = append(results, &CheckResult{
 			Name: CheckNameFio,
@@ -666,18 +814,18 @@ func CheckFIOResult(rr, rw, lat []byte) []*CheckResult {
 	}
 
 	// check results for rand read write
-	var rwRes map[string]interface{}
+	var rwRes map[string]any
 	if err := json.Unmarshal(rw, &rwRes); err != nil {
 		results = append(results, &CheckResult{
 			Name: CheckNameFio,
 			Err:  fmt.Errorf("error parsing result of random read write test, %s", err),
 		})
 	} else if jobs, ok := rwRes["jobs"]; ok {
-		readRes := jobs.([]interface{})[0].(map[string]interface{})["read"]
-		readIOPS := readRes.(map[string]interface{})["iops"]
+		readRes := jobs.([]any)[0].(map[string]any)["read"]
+		readIOPS := readRes.(map[string]any)["iops"]
 
-		writeRes := jobs.([]interface{})[0].(map[string]interface{})["write"]
-		writeIOPS := writeRes.(map[string]interface{})["iops"]
+		writeRes := jobs.([]any)[0].(map[string]any)["write"]
+		writeIOPS := writeRes.(map[string]any)["iops"]
 
 		results = append(results, &CheckResult{
 			Name: CheckNameFio,
@@ -691,20 +839,20 @@ func CheckFIOResult(rr, rw, lat []byte) []*CheckResult {
 	}
 
 	// check results for read write latency
-	var latRes map[string]interface{}
+	var latRes map[string]any
 	if err := json.Unmarshal(lat, &latRes); err != nil {
 		results = append(results, &CheckResult{
 			Name: CheckNameFio,
 			Err:  fmt.Errorf("error parsing result of read write latency test, %s", err),
 		})
 	} else if jobs, ok := latRes["jobs"]; ok {
-		readRes := jobs.([]interface{})[0].(map[string]interface{})["read"]
-		readLat := readRes.(map[string]interface{})["lat_ns"]
-		readLatAvg := readLat.(map[string]interface{})["mean"]
+		readRes := jobs.([]any)[0].(map[string]any)["read"]
+		readLat := readRes.(map[string]any)["lat_ns"]
+		readLatAvg := readLat.(map[string]any)["mean"]
 
-		writeRes := jobs.([]interface{})[0].(map[string]interface{})["write"]
-		writeLat := writeRes.(map[string]interface{})["lat_ns"]
-		writeLatAvg := writeLat.(map[string]interface{})["mean"]
+		writeRes := jobs.([]any)[0].(map[string]any)["write"]
+		writeLat := writeRes.(map[string]any)["lat_ns"]
+		writeLatAvg := writeLat.(map[string]any)["mean"]
 
 		results = append(results, &CheckResult{
 			Name: CheckNameFio,
@@ -720,15 +868,15 @@ func CheckFIOResult(rr, rw, lat []byte) []*CheckResult {
 	return results
 }
 
-// CheckTHP checks THP in /sys/kernel/mm/transparent_hugepage/{enabled,defrag}
-func CheckTHP(ctx context.Context, e ctxt.Executor) *CheckResult {
+// CheckTHP checks THP in /sys/kernel/mm/transparent_hugepage/enabled
+func CheckTHP(ctx context.Context, e ctxt.Executor, sudo bool) *CheckResult {
 	result := &CheckResult{
 		Name: CheckNameTHP,
 	}
 
 	m := module.NewShellModule(module.ShellModuleConfig{
-		Command: "cat /sys/kernel/mm/transparent_hugepage/{enabled,defrag}",
-		Sudo:    false,
+		Command: fmt.Sprintf(`if [ -d %[1]s ]; then cat %[1]s/enabled; fi`, "/sys/kernel/mm/transparent_hugepage"),
+		Sudo:    sudo,
 	})
 	stdout, stderr, err := m.Execute(ctx, e)
 	if err != nil {
@@ -736,8 +884,8 @@ func CheckTHP(ctx context.Context, e ctxt.Executor) *CheckResult {
 		return result
 	}
 
-	for _, line := range strings.Split(strings.Trim(string(stdout), "\n"), "\n") {
-		if !strings.Contains(line, "[never]") {
+	for line := range strings.SplitSeq(strings.Trim(string(stdout), "\n"), "\n") {
+		if len(line) > 0 && !strings.Contains(line, "[never]") {
 			result.Err = fmt.Errorf("THP is enabled, please disable it for best performance")
 			return result
 		}
@@ -757,7 +905,8 @@ func CheckJRE(ctx context.Context, e ctxt.Executor, host string, topo *spec.Spec
 		}
 
 		// check if java cli is available
-		stdout, stderr, err := e.Execute(ctx, "java -version", false)
+		// the checkpoint part of context can't be shared between goroutines
+		stdout, stderr, err := e.Execute(checkpoint.NewContext(ctx), "java -version", false)
 		if err != nil {
 			results = append(results, &CheckResult{
 				Name: CheckNameCommand,
@@ -804,7 +953,7 @@ func CheckDirPermission(ctx context.Context, e ctxt.Executor, user, path string)
 
 	_, stderr, err := e.Execute(ctx,
 		fmt.Sprintf(
-			"sudo -u %[1]s touch %[2]s/.tiup_cluster_check_file && rm -f %[2]s/.tiup_cluster_check_file",
+			"/usr/bin/sudo -u %[1]s touch %[2]s/.tiup_cluster_check_file && rm -f %[2]s/.tiup_cluster_check_file",
 			user,
 			path,
 		),
@@ -823,4 +972,103 @@ func CheckDirPermission(ctx context.Context, e ctxt.Executor, user, path string)
 	}
 
 	return results
+}
+
+// CheckDirIsExist check if the directory exists
+func CheckDirIsExist(ctx context.Context, e ctxt.Executor, path string) []*CheckResult {
+	var results []*CheckResult
+
+	if path == "" {
+		return results
+	}
+
+	req, _, _ := e.Execute(ctx,
+		fmt.Sprintf(
+			"[ -e %s ] && echo 1",
+			path,
+		),
+		false)
+
+	if strings.ReplaceAll(string(req), "\n", "") == "1" {
+		results = append(results, &CheckResult{
+			Name: CheckNameDirExist,
+			Err:  fmt.Errorf("%s already exists", path),
+			Msg:  fmt.Sprintf("%s already exists", path),
+		})
+	}
+
+	return results
+}
+
+// CheckTimeZone performs checks if time zone is the same
+func CheckTimeZone(ctx context.Context, topo *spec.Specification, host string, rawData []byte) []*CheckResult {
+	var results []*CheckResult
+	var insightInfo, pd0insightInfo insight.Info
+	if err := json.Unmarshal(rawData, &insightInfo); err != nil {
+		return append(results, &CheckResult{
+			Name: CheckNameTimeZone,
+			Err:  err,
+		})
+	}
+
+	if len(topo.PDServers) < 1 {
+		return append(results, &CheckResult{
+			Name: CheckNameTimeZone,
+			Err:  fmt.Errorf("no pd found"),
+		})
+	}
+	// skip compare with itself
+	if topo.PDServers[0].Host == host {
+		return nil
+	}
+	pd0stdout, _, _ := ctxt.GetInner(ctx).GetOutputs(topo.PDServers[0].Host)
+	if err := json.Unmarshal(pd0stdout, &pd0insightInfo); err != nil {
+		return append(results, &CheckResult{
+			Name: CheckNameTimeZone,
+			Err:  err,
+		})
+	}
+
+	timezone := insightInfo.SysInfo.Node.Timezone
+	pd0timezone := pd0insightInfo.SysInfo.Node.Timezone
+
+	if timezone == pd0timezone {
+		results = append(results, &CheckResult{
+			Name: CheckNameTimeZone,
+			Msg:  "time zone is the same as the first PD machine: " + timezone,
+		})
+	} else {
+		results = append(results, &CheckResult{
+			Name: CheckNameTimeZone,
+			Err:  fmt.Errorf("time zone is %s, but the firt PD is %s", timezone, pd0timezone),
+		})
+	}
+	return results
+}
+
+// compareVersion compares two version strings v1 and v2.
+// It returns 1 if v1 > v2, -1 if v1 < v2, and 0 if v1 == v2.
+func compareVersion(v1, v2 string) int {
+	// Split version strings by "." into slices
+	p1 := strings.Split(v1, ".")
+	p2 := strings.Split(v2, ".")
+
+	for i := 0; i < len(p1) || i < len(p2); i++ {
+		var n1, n2 int
+		// Convert string segment to integer for numeric comparison
+		if i < len(p1) {
+			n1, _ = strconv.Atoi(p1[i])
+		}
+		if i < len(p2) {
+			n2, _ = strconv.Atoi(p2[i])
+		}
+
+		if n1 > n2 {
+			return 1
+		}
+		if n1 < n2 {
+			return -1
+		}
+	}
+	return 0
 }

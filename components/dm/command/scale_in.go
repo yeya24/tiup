@@ -26,8 +26,8 @@ import (
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
 	"github.com/pingcap/tiup/pkg/cluster/task"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/set"
+	"github.com/pingcap/tiup/pkg/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -47,12 +47,20 @@ func newScaleInCmd() *cobra.Command {
 				b.Func(
 					fmt.Sprintf("ScaleInCluster: options=%+v", gOpt),
 					func(ctx context.Context) error {
-						return ScaleInDMCluster(ctx, metadata.Topology, gOpt)
+						return ScaleInDMCluster(ctx, metadata.Topology, gOpt, tlsCfg)
 					},
 				).Serial(dmtask.NewUpdateDMMeta(clusterName, metadata, gOpt.Nodes))
 			}
 
 			return cm.ScaleIn(clusterName, skipConfirm, gOpt, scale)
+		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			switch len(args) {
+			case 0:
+				return shellCompGetClusterName(cm, toComplete)
+			default:
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
 		},
 	}
 
@@ -69,6 +77,7 @@ func ScaleInDMCluster(
 	ctx context.Context,
 	topo *dm.Specification,
 	options operator.Options,
+	tlsCfg *tls.Config,
 ) error {
 	// instances by uuid
 	instances := map[string]dm.Instance{}
@@ -78,7 +87,7 @@ func ScaleInDMCluster(
 	for _, component := range topo.ComponentsByStartOrder() {
 		for _, instance := range component.Instances() {
 			instances[instance.ID()] = instance
-			instCount[instance.GetHost()]++
+			instCount[instance.GetManageHost()]++
 		}
 	}
 
@@ -104,8 +113,8 @@ func ScaleInDMCluster(
 				if !deletedNodes.Exist(instance.ID()) {
 					continue
 				}
-				instCount[instance.GetHost()]--
-				if err := operator.StopAndDestroyInstance(ctx, topo, instance, options, instCount[instance.GetHost()] == 0); err != nil {
+				instCount[instance.GetManageHost()]--
+				if err := operator.StopAndDestroyInstance(ctx, topo, instance, options, false, instCount[instance.GetManageHost()] == 0, tlsCfg); err != nil {
 					log.Warnf("failed to stop/destroy %s: %v", component.Name(), err)
 				}
 			}
@@ -118,7 +127,7 @@ func ScaleInDMCluster(
 	var dmMasterEndpoint []string
 	for _, instance := range (&dm.DMMasterComponent{Topology: topo}).Instances() {
 		if !deletedNodes.Exist(instance.ID()) {
-			dmMasterEndpoint = append(dmMasterEndpoint, operator.Addr(instance))
+			dmMasterEndpoint = append(dmMasterEndpoint, utils.JoinHostPort(instance.GetManageHost(), instance.GetPort()))
 		}
 	}
 
@@ -126,7 +135,14 @@ func ScaleInDMCluster(
 		return errors.New("cannot find available dm-master instance")
 	}
 
-	dmMasterClient = api.NewDMMasterClient(dmMasterEndpoint, 10*time.Second, nil)
+	dmMasterClient = api.NewDMMasterClient(dmMasterEndpoint, 10*time.Second, tlsCfg)
+
+	noAgentHosts := set.NewStringSet()
+	topo.IterInstance(func(inst dm.Instance) {
+		if inst.IgnoreMonitorAgent() {
+			noAgentHosts.Insert(inst.GetManageHost())
+		}
+	})
 
 	// Delete member from cluster
 	for _, component := range topo.ComponentsByStartOrder() {
@@ -135,7 +151,16 @@ func ScaleInDMCluster(
 				continue
 			}
 
-			if err := operator.StopComponent(ctx, []dm.Instance{instance}, options.OptTimeout); err != nil {
+			if err := operator.StopComponent(
+				ctx,
+				topo,
+				[]dm.Instance{instance},
+				noAgentHosts,
+				options,
+				false,
+				false,         /* evictLeader */
+				&tls.Config{}, /* not used as evictLeader is false */
+			); err != nil {
 				return errors.Annotatef(err, "failed to stop %s", component.Name())
 			}
 
@@ -158,9 +183,9 @@ func ScaleInDMCluster(
 				return errors.Annotatef(err, "failed to destroy %s", component.Name())
 			}
 
-			instCount[instance.GetHost()]--
-			if instCount[instance.GetHost()] == 0 {
-				if err := operator.DeletePublicKey(ctx, instance.GetHost()); err != nil {
+			instCount[instance.GetManageHost()]--
+			if instCount[instance.GetManageHost()] == 0 {
+				if err := operator.DeletePublicKey(ctx, instance.GetManageHost()); err != nil {
 					return errors.Annotatef(err, "failed to delete public key")
 				}
 			}

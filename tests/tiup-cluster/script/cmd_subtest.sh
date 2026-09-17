@@ -1,25 +1,58 @@
 #!/bin/bash
 
+set -eu
+
 function cmd_subtest() {
     mkdir -p ~/.tiup/bin/
 
-    version=$1
-    test_tls=$2
-    native_ssh=$3
+    version="nightly"
+    topo_name="full"
+    test_tls=false
+    native_ssh=false
+    
+    while [[ $# -gt 0 ]]
+    do
+        case $1 in
+            --version)
+                version="$2"
+                shift
+                shift
+                ;;
+            --topo)
+                topo_name="$2"
+                shift
+                shift
+                ;;
+            --tls)
+                test_tls=true
+                shift
+                ;;
+            --native-ssh)
+                native_ssh=true
+                shift
+                ;;
+        esac
+    done
 
     name="test_cmd_$RANDOM"
     if [ $test_tls = true ]; then
-        topo=./topo/full_tls.yaml
+        topo=./topo/${topo_name}_tls.yaml
     else
-        topo=./topo/full.yaml
+        topo=./topo/${topo_name}.yaml
     fi
 
     client=""
     if [ $native_ssh == true ]; then
-        client="--native-ssh"
+        client="--ssh=system"
     fi
 
+    # identify SSH via ssh-agent
+    eval $(ssh-agent)
+    ssh-add /root/.ssh/id_rsa
+
+    mv /root/.ssh/id_rsa{,.bak}
     tiup-cluster $client check $topo -i ~/.ssh/id_rsa --enable-mem --enable-cpu --apply
+    mv /root/.ssh/id_rsa{.bak,}
 
     check_result=`tiup-cluster $client --yes check $topo -i ~/.ssh/id_rsa`
 
@@ -31,6 +64,7 @@ function cmd_subtest() {
     echo $check_result | grep "service"
     echo $check_result | grep "thp"
 
+    for i in {1..5}; do ssh -o "StrictHostKeyChecking=no" -o "PasswordAuthentication=no" n"$i" "grep -q tidb /etc/passwd && (killall -u tidb; userdel -f -r tidb) || true"; done
     # This should fail because there is no such user: tidb
     ! tiup-cluster $client --yes deploy $name $version $topo -i ~/.ssh/id_rsa --skip-create-user
     # This is a normal deploy
@@ -54,7 +88,13 @@ function cmd_subtest() {
     id=`tiup-cluster audit | grep "deploy $name $version" | awk '{print $1}'`
     tiup-cluster $client audit $id
 
-    tiup-cluster $client --yes start $name
+    if ! tiup-cluster $client --yes --wait-timeout=300 start $name; then
+        echo "start failed, dumping tidb-4000 logs on n1"
+        tiup-cluster $client exec $name -N n1 --command "systemctl status tidb-4000 --no-pager -l || true"
+        tiup-cluster $client exec $name -N n1 --command "journalctl -u tidb-4000 -n 200 --no-pager || true"
+        tiup-cluster $client exec $name -N n1 --command "tail -n 200 /home/tidb/deploy/tidb-4000/log/tidb.log 2>/dev/null || true"
+        exit 1
+    fi
 
     # Patch a stopped cluster
     tiup-cluster $client --yes patch $name ~/.tiup/storage/cluster/packages/tidb-v$version-linux-amd64.tar.gz -R tidb --offline
@@ -97,7 +137,13 @@ function cmd_subtest() {
     # let the CI to stop the job if hang forever
     ! tiup-cluster $client --yes start $name -R prometheus,grafana
 
-    tiup-cluster $client --yes restart $name
+    if ! tiup-cluster $client --yes --wait-timeout=300 restart $name; then
+        echo "restart failed, dumping tidb-4000 logs on n1"
+        tiup-cluster $client exec $name -N n1 --command "systemctl status tidb-4000 --no-pager -l || true"
+        tiup-cluster $client exec $name -N n1 --command "journalctl -u tidb-4000 -n 200 --no-pager || true"
+        tiup-cluster $client exec $name -N n1 --command "tail -n 200 /home/tidb/deploy/tidb-4000/log/tidb.log 2>/dev/null || true"
+        exit 1
+    fi
 
     tiup-cluster $client _test $name writable
 
@@ -118,6 +164,12 @@ function cmd_subtest() {
     # Test rename
     tiup-cluster $client --yes rename $name "tmp-cluster-name"
     tiup-cluster $client display "tmp-cluster-name"
+    if [ $test_tls = true ]; then
+        local_ca="$HOME/.tiup/storage/cluster/clusters/tmp-cluster-name/tls/ca.crt"
+        local_ca_sum=`sha256sum "$local_ca" | awk '{print $1}'`
+        remote_ca_sum=`ssh -o "StrictHostKeyChecking=no" -o "PasswordAuthentication=no" n1 "sha256sum /home/tidb/deploy/tidb-4000/tls/ca.crt" | awk '{print $1}'`
+        test "$local_ca_sum" = "$remote_ca_sum"
+    fi
     tiup-cluster $client --yes rename "tmp-cluster-name" $name
 
     # Test enable & disable

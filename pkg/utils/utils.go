@@ -14,20 +14,23 @@
 package utils
 
 import (
+	"math"
+	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/pflag"
 )
 
 // JoinInt joins a slice of int to string
 func JoinInt(nums []int, delim string) string {
-	result := ""
+	var result strings.Builder
 	for _, i := range nums {
-		result += strconv.Itoa(i)
-		result += delim
+		result.WriteString(strconv.Itoa(i))
+		result.WriteString(delim)
 	}
-	return strings.TrimSuffix(result, delim)
+	return strings.TrimSuffix(result.String(), delim)
 }
 
 // IsFlagSetByUser check if the a flag is set by user explicitly
@@ -45,4 +48,40 @@ func IsFlagSetByUser(flagSet *pflag.FlagSet, flagName string) bool {
 func MustAtoI(a string) int {
 	v, _ := strconv.Atoi(a)
 	return v
+}
+
+// Base62Tag returns a tag based on time
+func Base62Tag() string {
+	const base = 62
+	const sets = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	b := make([]byte, 0)
+	num := time.Now().UnixNano() / int64(time.Millisecond)
+	for num > 0 {
+		r := math.Mod(float64(num), float64(base))
+		num /= base
+		b = append([]byte{sets[int(r)]}, b...)
+	}
+	return string(b)
+}
+
+// Ternary operator
+func Ternary(condition bool, a, b any) any {
+	if condition {
+		return a
+	}
+	return b
+}
+
+// JoinHostPort return host and port
+func JoinHostPort(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// ParseHostPort Prase host and port
+func ParseHostPort(hostport string) (host, port string) {
+	colon := strings.LastIndex(hostport, ":")
+
+	host = strings.TrimSuffix(strings.TrimPrefix(hostport[:colon], "["), "]")
+	port = hostport[colon+1:]
+	return
 }

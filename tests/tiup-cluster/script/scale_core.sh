@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -eu
+
 function scale_core() {
     mkdir -p ~/.tiup/bin/
 
@@ -9,7 +11,7 @@ function scale_core() {
 
     client=""
     if [ $native_ssh == true ]; then
-        client="--native-ssh"
+        client="--ssh=system"
     fi
 
     name="test_scale_core_$RANDOM"
@@ -23,18 +25,29 @@ function scale_core() {
 
     tiup-cluster $client list | grep "$name"
 
-    tiup-cluster $client --yes start $name
+    if ! tiup-cluster $client --yes --wait-timeout=300 start $name; then
+        echo "start failed, dumping tidb-4000 logs on n1"
+        tiup-cluster $client exec $name -N n1 --command "systemctl status tidb-4000 --no-pager -l || true"
+        tiup-cluster $client exec $name -N n1 --command "journalctl -u tidb-4000 -n 200 --no-pager || true"
+        tiup-cluster $client exec $name -N n1 --command "tail -n 200 /home/tidb/deploy/tidb-4000/log/tidb.log 2>/dev/null || true"
+        exit 1
+    fi
 
     tiup-cluster $client _test $name writable
 
     tiup-cluster $client display $name
+    assert_prometheus_external_labels $name n1 production us-east-1
 
     tiup-cluster $client --yes reload $name --skip-restart
 
     if [ $test_tls = true ]; then
-        total_sub_one=18
+        total_sub_one=19
+        total=20
+        total_add_one=21
     else
-        total_sub_one=21
+        total_sub_one=22
+        total=23
+        total_add_one=24
     fi
 
     echo "start scale in tidb"
@@ -42,13 +55,15 @@ function scale_core() {
     wait_instance_num_reach $name $total_sub_one $native_ssh
     # ensure Prometheus's configuration is updated automatically
     ! tiup-cluster $client exec $name -N n1 --command "grep -q n1:10080 /home/tidb/deploy/prometheus-9090/conf/prometheus.yml"
+    assert_prometheus_external_labels $name n1 production us-east-1
 
     echo "start scale out tidb"
     topo=./topo/full_scale_in_tidb.yaml
     tiup-cluster $client --yes scale-out $name $topo
     # after scale-out, ensure the service is enabled
-    tiup-cluster $client exec $name -N n1 --command "systemctl status tidb-4000 | grep Loaded |grep 'enabled; vendor'"
+    tiup-cluster $client exec $name -N n1 --command "systemctl is-enabled --quiet tidb-4000"
     tiup-cluster $client exec $name -N n1 --command "grep -q n1:10080 /home/tidb/deploy/prometheus-9090/conf/prometheus.yml"
+    assert_prometheus_external_labels $name n1 production us-east-1
 
     # scale in tikv maybe exists in several minutes or hours, and the GitHub CI is not guaranteed
     # echo "start scale in tikv"
@@ -64,12 +79,14 @@ function scale_core() {
 
     # ensure Prometheus's configuration is updated automatically
     ! tiup-cluster $client exec $name -N n1 --command "grep -q n3:8250 /home/tidb/deploy/prometheus-9090/conf/prometheus.yml"
+    assert_prometheus_external_labels $name n1 production us-east-1
 
     echo "start scale out pump"
     topo=./topo/full_scale_in_pump.yaml
     tiup-cluster $client --yes scale-out $name $topo
     # after scale-out, ensure this instance come back
     tiup-cluster $client exec $name -N n1 --command "grep -q n3:8250 /home/tidb/deploy/prometheus-9090/conf/prometheus.yml"
+    assert_prometheus_external_labels $name n1 production us-east-1
 
     echo "start scale in pd"
     tiup-cluster $client --yes scale-in $name -N n3:2379
@@ -80,6 +97,7 @@ function scale_core() {
     ! tiup-cluster $client exec $name -N n1 --command "grep -q n3:2379 /home/tidb/deploy/tidb-4000/scripts/run_tidb.sh"
     # ensure Prometheus's configuration is updated automatically
     ! tiup-cluster $client exec $name -N n1 --command "grep -q n3:2379 /home/tidb/deploy/prometheus-9090/conf/prometheus.yml"
+    assert_prometheus_external_labels $name n1 production us-east-1
 
     echo "start scale out pd"
     topo=./topo/full_scale_in_pd.yaml
@@ -87,6 +105,17 @@ function scale_core() {
     # after scale-out, ensure this instance come back
     tiup-cluster $client exec $name -N n1 --command "grep -q n3:2379 /home/tidb/deploy/tidb-4000/scripts/run_tidb.sh"
     tiup-cluster $client exec $name -N n1 --command "grep -q n3:2379 /home/tidb/deploy/prometheus-9090/conf/prometheus.yml"
+    assert_prometheus_external_labels $name n1 production us-east-1
+
+    echo "start scale out tiproxy"
+    topo=./topo/full_scale_in_tiproxy.yaml
+    tiup-cluster $client --yes scale-out $name $topo
+    wait_instance_num_reach $name $total_add_one $native_ssh
+
+    echo "start scale in tiproxy"
+    tiup-cluster $client --yes scale-in $name -N n1:6000
+    wait_instance_num_reach $name $total $native_ssh
+
 
     echo "start scale in tidb"
     tiup-cluster $client --yes scale-in $name -N n2:4000
@@ -106,4 +135,5 @@ function scale_core() {
     tiup-cluster $client exec $name -N n2 --command "ps aux | grep blackbox_exporter | grep -qv grep"
 
     tiup-cluster $client _test $name writable
+    tiup-cluster $client --yes destroy $name
 }

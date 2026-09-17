@@ -26,7 +26,6 @@ Available Commands:
   display       Get cluster information
   list          Get cluster list
   audit         View cluster operation log
-  import        Import a cluster deployed by TiDB-Ansible
   edit-config   Editing the configuration of TiDB clusters
   reload        for overriding cluster configurations when necessary
   patch         replaces deployed components on its cluster with temporary component packages
@@ -75,6 +74,25 @@ grafana_servers:
 monitoring_servers:
   - host: 172.16.5.134
 ```
+
+Starting in TiUP 1.17.0, you can also set Prometheus global
+`external_labels` under `monitoring_servers`:
+
+```yaml
+monitoring_servers:
+  - host: 172.16.5.134
+    external_labels:
+      environment: production
+      region: us-east-1
+```
+
+Use this field to attach stable metadata that should be propagated through
+Prometheus `remote_write`, federation, and alerts. TiUP renders the configured
+key/value pairs as-is.
+
+Note: older TiUP versions do not ignore unknown topology fields here. If a
+topology file containing `monitoring_servers[].external_labels` is opened by an
+older TiUP that does not support this field, topology parsing fails.
 
 Save the file as `/tmp/topology.yaml`. If we want to use TiDB's v4.0.0-rc version with the cluster name prod-cluster, run:
 
@@ -327,41 +345,4 @@ Or just replace one of the TiDBs:
 
 ```
 tiup cluster patch test-cluster /tmp/tidb-hotfix.tar.gz -N 172.16.4.5:4000
-```
-
-## Importing TiDB-Ansible clusters
-
-Before TiUP, clusters were generally deployed using TiDB-Ansible, and the import command was used to transition this part of the cluster to TiUP receivership.
-Use of the import command.
-
-```bash
-[user@localhost ~]# tiup cluster import --help
-Import an existing TiDB cluster from TiDB-Ansible
-
-Usage:
-  tiup cluster import [flags]
-
-Flags:
-  -d, --dir string          TiDB-Ansible's directory, default is current directory
-  -h, -help import          help information
-      --inventory string    inventory file name (default is "event.ini")
-      --no-backup           does not backup Ansible directories, for Ansible directories with multiple inventory files
-  -r, --rename NAME         Rename the imported cluster
-
-Global Flags:
-      --ssh-timeout int     SSH connection timeout
-  -y, --yes                 Skip all confirmation steps
-```
-
-Example: Importing a cluster:
-
-```bash
-cd tidb-ansible
-tiup cluster import
-```
-
-perhaps
-
-```bash
-tiup cluster import --dir=/path/to/tidb-ansible
 ```

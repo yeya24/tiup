@@ -17,7 +17,7 @@ import (
 	"bytes"
 
 	"github.com/pingcap/tiup/pkg/cluster/audit"
-	utils2 "github.com/pingcap/tiup/pkg/utils"
+	"github.com/pingcap/tiup/pkg/utils"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -44,21 +44,29 @@ func newAuditLogCore() zapcore.Core {
 	return zapcore.NewCore(encoder, zapcore.Lock(zapcore.AddSync(auditBuffer)), zapcore.DebugLevel)
 }
 
-// OutputAuditLogIfEnabled outputs audit log if enabled.
-func OutputAuditLogIfEnabled() error {
+// OutputAuditLogToFileIfEnabled outputs audit log to specified fileSuffix if enabled.
+func OutputAuditLogToFileIfEnabled(dir, fileSuffix string) error {
 	if !auditEnabled.Load() {
 		return nil
 	}
 
-	if err := utils2.CreateDir(auditDir); err != nil {
+	if err := utils.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
-	err := audit.OutputAuditLog(auditDir, auditBuffer.Bytes())
+	err := audit.OutputAuditLog(dir, fileSuffix, auditBuffer.Bytes())
 	if err != nil {
 		return err
 	}
-	auditBuffer.Reset()
+
+	if dir == auditDir {
+		auditBuffer.Reset()
+	}
 
 	return nil
+}
+
+// OutputAuditLogIfEnabled outputs audit log if enabled.
+func OutputAuditLogIfEnabled() error {
+	return OutputAuditLogToFileIfEnabled(auditDir, "")
 }

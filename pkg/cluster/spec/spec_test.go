@@ -15,64 +15,83 @@ package spec
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
-	. "github.com/pingcap/check"
 	"github.com/pingcap/tiup/pkg/cluster/template/scripts"
-	"gopkg.in/yaml.v2"
+	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/tidbver"
+	"github.com/pingcap/tiup/pkg/utils"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
-type metaSuiteTopo struct {
-}
-
-var _ = Suite(&metaSuiteTopo{})
-
-func TestMeta(t *testing.T) {
-	TestingT(t)
-}
-
-func (s *metaSuiteTopo) TestDefaultDataDir(c *C) {
+func TestDefaultDataDir(t *testing.T) {
 	// Test with without global DataDir.
 	topo := new(Specification)
 	topo.TiKVServers = append(topo.TiKVServers, &TiKVSpec{Host: "1.1.1.1", Port: 22})
+	topo.TiKVWorkerServers = append(topo.TiKVWorkerServers, &TiKVWorkerSpec{Host: "1.1.1.2", Port: 22})
+	topo.CDCServers = append(topo.CDCServers, &CDCSpec{Host: "2.3.3.3", Port: 22})
+	topo.TiKVCDCServers = append(topo.TiKVCDCServers, &TiKVCDCSpec{Host: "3.3.3.3", Port: 22})
 	data, err := yaml.Marshal(topo)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	// Check default value.
 	topo = new(Specification)
 	err = yaml.Unmarshal(data, topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.GlobalOptions.DataDir, Equals, "data")
-	c.Assert(topo.TiKVServers[0].DataDir, Equals, "data")
+	require.NoError(t, err)
+	require.Equal(t, "data", topo.GlobalOptions.DataDir)
+	require.Equal(t, "data", topo.TiKVServers[0].DataDir)
+	require.Equal(t, "data", topo.TiKVWorkerServers[0].DataDir)
+	require.Equal(t, "data", topo.CDCServers[0].DataDir)
+	require.Equal(t, "data", topo.TiKVCDCServers[0].DataDir)
 
 	// Can keep the default value.
 	data, err = yaml.Marshal(topo)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	topo = new(Specification)
 	err = yaml.Unmarshal(data, topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.GlobalOptions.DataDir, Equals, "data")
-	c.Assert(topo.TiKVServers[0].DataDir, Equals, "data")
+	require.NoError(t, err)
+	require.Equal(t, "data", topo.GlobalOptions.DataDir)
+	require.Equal(t, "data", topo.TiKVServers[0].DataDir)
+	require.Equal(t, "data", topo.TiKVWorkerServers[0].DataDir)
+	require.Equal(t, "data", topo.CDCServers[0].DataDir)
+	require.Equal(t, "data", topo.TiKVCDCServers[0].DataDir)
 
 	// Test with global DataDir.
 	topo = new(Specification)
-	topo.GlobalOptions.DataDir = "/gloable_data"
+	topo.GlobalOptions.DataDir = "/global_data"
 	topo.TiKVServers = append(topo.TiKVServers, &TiKVSpec{Host: "1.1.1.1", Port: 22})
 	topo.TiKVServers = append(topo.TiKVServers, &TiKVSpec{Host: "1.1.1.2", Port: 33, DataDir: "/my_data"})
+	topo.TiKVWorkerServers = append(topo.TiKVWorkerServers, &TiKVWorkerSpec{Host: "1.1.1.3", Port: 22})
+	topo.TiKVWorkerServers = append(topo.TiKVWorkerServers, &TiKVWorkerSpec{Host: "1.1.1.4", Port: 33, DataDir: "/my_worker_data"})
+	topo.CDCServers = append(topo.CDCServers, &CDCSpec{Host: "2.3.3.3", Port: 22})
+	topo.CDCServers = append(topo.CDCServers, &CDCSpec{Host: "2.3.3.4", Port: 22, DataDir: "/cdc_data"})
+	topo.TiKVCDCServers = append(topo.TiKVCDCServers, &TiKVCDCSpec{Host: "3.3.3.3", Port: 22})
+	topo.TiKVCDCServers = append(topo.TiKVCDCServers, &TiKVCDCSpec{Host: "3.3.3.4", Port: 22, DataDir: "/tikv-cdc_data"})
 	data, err = yaml.Marshal(topo)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	topo = new(Specification)
 	err = yaml.Unmarshal(data, topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.GlobalOptions.DataDir, Equals, "/gloable_data")
-	c.Assert(topo.TiKVServers[0].DataDir, Equals, "/gloable_data/tikv-22")
-	c.Assert(topo.TiKVServers[1].DataDir, Equals, "/my_data")
+	require.NoError(t, err)
+	require.Equal(t, "/global_data", topo.GlobalOptions.DataDir)
+	require.Equal(t, "/global_data/tikv-22", topo.TiKVServers[0].DataDir)
+	require.Equal(t, "/my_data", topo.TiKVServers[1].DataDir)
+
+	require.Equal(t, "/global_data/tikv-worker-22", topo.TiKVWorkerServers[0].DataDir)
+	require.Equal(t, "/my_worker_data", topo.TiKVWorkerServers[1].DataDir)
+
+	require.Equal(t, "/global_data/cdc-22", topo.CDCServers[0].DataDir)
+	require.Equal(t, "/cdc_data", topo.CDCServers[1].DataDir)
+
+	require.Equal(t, "/global_data/tikv-cdc-22", topo.TiKVCDCServers[0].DataDir)
+	require.Equal(t, "/tikv-cdc_data", topo.TiKVCDCServers[1].DataDir)
 }
 
-func (s *metaSuiteTopo) TestGlobalOptions(c *C) {
+func TestGlobalOptions(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 global:
@@ -86,19 +105,33 @@ tidb_servers:
 pd_servers:
   - host: 172.16.5.53
     data_dir: "pd-data"
+cdc_servers:
+  - host: 172.16.5.233
+    data_dir: "cdc-data"
+kvcdc_servers:
+  - host: 172.16.5.244
+    data_dir: "tikv-cdc-data"
 `), &topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.GlobalOptions.User, Equals, "test1")
-	c.Assert(topo.GlobalOptions.SSHPort, Equals, 220)
-	c.Assert(topo.TiDBServers[0].SSHPort, Equals, 220)
-	c.Assert(topo.TiDBServers[0].DeployDir, Equals, "tidb-deploy")
+	require.NoError(t, err)
+	require.Equal(t, "test1", topo.GlobalOptions.User)
+	require.Equal(t, 220, topo.GlobalOptions.SSHPort)
+	require.Equal(t, 220, topo.TiDBServers[0].SSHPort)
+	require.Equal(t, "tidb-deploy", topo.TiDBServers[0].DeployDir)
 
-	c.Assert(topo.PDServers[0].SSHPort, Equals, 220)
-	c.Assert(topo.PDServers[0].DeployDir, Equals, "test-deploy/pd-2379")
-	c.Assert(topo.PDServers[0].DataDir, Equals, "pd-data")
+	require.Equal(t, 220, topo.PDServers[0].SSHPort)
+	require.Equal(t, "test-deploy/pd-2379", topo.PDServers[0].DeployDir)
+	require.Equal(t, "pd-data", topo.PDServers[0].DataDir)
+
+	require.Equal(t, 220, topo.CDCServers[0].SSHPort)
+	require.Equal(t, "test-deploy/cdc-8300", topo.CDCServers[0].DeployDir)
+	require.Equal(t, "cdc-data", topo.CDCServers[0].DataDir)
+
+	require.Equal(t, 220, topo.TiKVCDCServers[0].SSHPort)
+	require.Equal(t, "test-deploy/tikv-cdc-8600", topo.TiKVCDCServers[0].DeployDir)
+	require.Equal(t, "tikv-cdc-data", topo.TiKVCDCServers[0].DataDir)
 }
 
-func (s *metaSuiteTopo) TestDataDirAbsolute(c *C) {
+func TestDataDirAbsolute(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 global:
@@ -109,14 +142,30 @@ pd_servers:
     data_dir: "pd-data"
   - host: 172.16.5.54
     client_port: 12379
+cdc_servers:
+  - host: 172.16.5.233
+    data_dir: "cdc-data"
+  - host: 172.16.5.234
+    port: 23333
+kvcdc_servers:
+  - host: 172.16.5.244
+    data_dir: "tikv-cdc-data"
+  - host: 172.16.5.245
+    port: 33333
 `), &topo)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
-	c.Assert(topo.PDServers[0].DataDir, Equals, "pd-data")
-	c.Assert(topo.PDServers[1].DataDir, Equals, "/test-data/pd-12379")
+	require.Equal(t, "pd-data", topo.PDServers[0].DataDir)
+	require.Equal(t, "/test-data/pd-12379", topo.PDServers[1].DataDir)
+
+	require.Equal(t, "cdc-data", topo.CDCServers[0].DataDir)
+	require.Equal(t, "/test-data/cdc-23333", topo.CDCServers[1].DataDir)
+
+	require.Equal(t, "tikv-cdc-data", topo.TiKVCDCServers[0].DataDir)
+	require.Equal(t, "/test-data/tikv-cdc-33333", topo.TiKVCDCServers[1].DataDir)
 }
 
-func (s *metaSuiteTopo) TestGlobalConfig(c *C) {
+func TestGlobalConfig(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 global:
@@ -139,6 +188,8 @@ server_configs:
     status.address: 10
     port: 1230
     scheduler.max_limit: 20480
+  kvcdc:
+    gc-ttl: 43200
 
 tidb_servers:
   - host: 172.16.5.138
@@ -151,34 +202,45 @@ tidb_servers:
     config:
       latch.capacity: 5000
       log.file.rotate: "55555.xxx"
+
+kvcdc_servers:
+  - host: 172.16.5.200
+  - host: 172.16.5.201
+    port: 8601
+    config:
+      log-level: "debug"
 `), &topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.ServerConfigs.TiDB, DeepEquals, map[string]interface{}{
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{
 		"status.address":  10,
 		"port":            1230,
 		"latch.capacity":  20480,
 		"log.file.rotate": "123445.xxx",
-	})
-	expected := map[string]interface{}{
-		"status": map[string]interface{}{
+	}, topo.ServerConfigs.TiDB)
+	require.Equal(t, map[string]any{
+		"gc-ttl": 43200,
+	}, topo.ServerConfigs.TiKVCDC)
+
+	expected := map[string]any{
+		"status": map[string]any{
 			"address": 10,
 		},
 		"port": 1230,
-		"latch": map[string]interface{}{
+		"latch": map[string]any{
 			"capacity": 20480,
 		},
-		"log": map[string]interface{}{
-			"file": map[string]interface{}{
+		"log": map[string]any{
+			"file": map[string]any{
 				"rotate": "123445.xxx",
 			},
 		},
 	}
 	got := FoldMap(topo.ServerConfigs.TiDB)
-	c.Assert(got, DeepEquals, expected)
+	require.Equal(t, expected, got)
 	buf := &bytes.Buffer{}
 	err = toml.NewEncoder(buf).Encode(expected)
-	c.Assert(err, IsNil)
-	c.Assert(buf.String(), Equals, `port = 1230
+	require.NoError(t, err)
+	require.Equal(t, `port = 1230
 
 [latch]
   capacity = 20480
@@ -189,38 +251,50 @@ tidb_servers:
 
 [status]
   address = 10
-`)
+`, buf.String())
 
-	expected = map[string]interface{}{
-		"latch": map[string]interface{}{
+	expected = map[string]any{
+		"latch": map[string]any{
 			"capacity": 3000,
 		},
-		"log": map[string]interface{}{
-			"file": map[string]interface{}{
+		"log": map[string]any{
+			"file": map[string]any{
 				"rotate": "44444.xxx",
 			},
 		},
 	}
 	got = FoldMap(topo.TiDBServers[0].Config)
-	c.Assert(err, IsNil)
-	c.Assert(got, DeepEquals, expected)
+	require.Equal(t, expected, got)
 
-	expected = map[string]interface{}{
-		"latch": map[string]interface{}{
+	expected = map[string]any{
+		"latch": map[string]any{
 			"capacity": 5000,
 		},
-		"log": map[string]interface{}{
-			"file": map[string]interface{}{
+		"log": map[string]any{
+			"file": map[string]any{
 				"rotate": "55555.xxx",
 			},
 		},
 	}
 	got = FoldMap(topo.TiDBServers[1].Config)
-	c.Assert(err, IsNil)
-	c.Assert(got, DeepEquals, expected)
+	require.Equal(t, expected, got)
+
+	expected = map[string]any{}
+	got = FoldMap(topo.TiKVCDCServers[0].Config)
+	require.Equal(t, expected, got)
+
+	expected = map[string]any{}
+	got = FoldMap(topo.TiKVCDCServers[0].Config)
+	require.Equal(t, expected, got)
+
+	expected = map[string]any{
+		"log-level": "debug",
+	}
+	got = FoldMap(topo.TiKVCDCServers[1].Config)
+	require.Equal(t, expected, got)
 }
 
-func (s *metaSuiteTopo) TestGlobalConfigPatch(c *C) {
+func TestGlobalConfigPatch(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 tikv_sata_config: &tikv_sata_config
@@ -234,23 +308,22 @@ tikv_servers:
     config: *tikv_sata_config
 
 `), &topo)
-	c.Assert(err, IsNil)
-	expected := map[string]interface{}{
-		"config": map[string]interface{}{
+	require.NoError(t, err)
+	expected := map[string]any{
+		"config": map[string]any{
 			"item1": 100,
 			"item2": 300,
-			"item3": map[string]interface{}{
+			"item3": map[string]any{
 				"item5": 500,
 				"item6": 600,
 			},
 		},
 	}
 	got := FoldMap(topo.TiKVServers[0].Config)
-	c.Assert(err, IsNil)
-	c.Assert(got, DeepEquals, expected)
+	require.Equal(t, expected, got)
 }
 
-func (s *metaSuiteTopo) TestLogDir(c *C) {
+func TestLogDir(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 tidb_servers:
@@ -258,28 +331,28 @@ tidb_servers:
     deploy_dir: "test-deploy"
     log_dir: "test-deploy/log"
 `), &topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.TiDBServers[0].LogDir, Equals, "test-deploy/log")
+	require.NoError(t, err)
+	require.Equal(t, "test-deploy/log", topo.TiDBServers[0].LogDir)
 }
 
-func (s *metaSuiteTopo) TestMonitorLogDir(c *C) {
+func TestMonitorLogDir(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 monitored:
     deploy_dir: "test-deploy"
     log_dir: "test-deploy/log"
 `), &topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.MonitoredOptions.LogDir, Equals, "test-deploy/log")
+	require.NoError(t, err)
+	require.Equal(t, "test-deploy/log", topo.MonitoredOptions.LogDir)
 
 	out, err := yaml.Marshal(topo)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	err = yaml.Unmarshal(out, &topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.MonitoredOptions.LogDir, Equals, "test-deploy/log")
+	require.NoError(t, err)
+	require.Equal(t, "test-deploy/log", topo.MonitoredOptions.LogDir)
 }
 
-func (s *metaSuiteTopo) TestMerge2Toml(c *C) {
+func TestMerge2Toml(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 server_configs:
@@ -288,6 +361,8 @@ server_configs:
     config.item2: 300
     config.item3.item5: 500
     config.item3.item6: 600
+  kvcdc:
+    gc-ttl: 43200
 
 tikv_servers:
   - host: 172.16.5.138
@@ -295,8 +370,13 @@ tikv_servers:
       config.item2: 500
       config.item3.item5: 700
 
+kvcdc_servers:
+  - host: 172.16.5.238
+    config:
+      log-level: "debug"
+
 `), &topo)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	expected := `# WARNING: This file is auto-generated. Do not edit! All your modification will be overwritten!
 # You can use 'tiup cluster edit-config' and 'tiup cluster reload' to update the configuration
 # All configuration items you want to change can be added to:
@@ -311,12 +391,26 @@ item2 = 500
 item5 = 700
 item6 = 600
 `
-	got, err := merge2Toml("tikv", topo.ServerConfigs.TiKV, topo.TiKVServers[0].Config)
-	c.Assert(err, IsNil)
-	c.Assert(string(got), DeepEquals, expected)
+	got, err := Merge2Toml("tikv", topo.ServerConfigs.TiKV, topo.TiKVServers[0].Config)
+	require.NoError(t, err)
+	require.Equal(t, expected, string(got))
+
+	expected = `# WARNING: This file is auto-generated. Do not edit! All your modification will be overwritten!
+# You can use 'tiup cluster edit-config' and 'tiup cluster reload' to update the configuration
+# All configuration items you want to change can be added to:
+# server_configs:
+#   kvcdc:
+#     aa.b1.c3: value
+#     aa.b2.c4: value
+gc-ttl = 43200
+log-level = "debug"
+`
+	got, err = Merge2Toml("kvcdc", topo.ServerConfigs.TiKVCDC, topo.TiKVCDCServers[0].Config)
+	require.NoError(t, err)
+	require.Equal(t, expected, string(got))
 }
 
-func (s *metaSuiteTopo) TestMerge2Toml2(c *C) {
+func TestMerge2Toml2(t *testing.T) {
 	topo := Specification{}
 	err := yaml.Unmarshal([]byte(`
 global:
@@ -369,7 +463,7 @@ pd_servers:
 tikv_servers:
   - host: 172.19.0.103
 `), &topo)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	expected := `# WARNING: This file is auto-generated. Do not edit! All your modification will be overwritten!
 # You can use 'tiup cluster edit-config' and 'tiup cluster reload' to update the configuration
 # All configuration items you want to change can be added to:
@@ -400,80 +494,12 @@ region-schedule-limit = 2048
 replica-schedule-limit = 164
 split-merge-interval = "1h"
 `
-	got, err := merge2Toml("pd", topo.ServerConfigs.PD, topo.PDServers[1].Config)
-	c.Assert(err, IsNil)
-	c.Assert(string(got), DeepEquals, expected)
+	got, err := Merge2Toml("pd", topo.ServerConfigs.PD, topo.PDServers[1].Config)
+	require.NoError(t, err)
+	require.Equal(t, expected, string(got))
 }
 
-func (s *metaSuiteTopo) TestMergeImported(c *C) {
-	spec := Specification{}
-
-	// values set in topology specification of the cluster
-	err := yaml.Unmarshal([]byte(`
-server_configs:
-  tikv:
-    config.item1: 100
-    config.item2: 300
-    config.item3.item5: 500
-    config.item3.item6: 600
-    config2.item4.item7: 700
-
-tikv_servers:
-  - host: 172.16.5.138
-    config:
-      config.item2: 500
-      config.item3.item5: 700
-      config2.itemy: 1000
-
-`), &spec)
-	c.Assert(err, IsNil)
-
-	// values set in imported configs, this will be overritten by values from
-	// topology specification if present there
-	config := []byte(`
-[config]
-item2 = 501
-[config.item3]
-item5 = 701
-item6 = 600
-
-[config2]
-itemx = "valuex"
-itemy = 999
-[config2.item4]
-item7 = 780
-`)
-
-	expected := `# WARNING: This file is auto-generated. Do not edit! All your modification will be overwritten!
-# You can use 'tiup cluster edit-config' and 'tiup cluster reload' to update the configuration
-# All configuration items you want to change can be added to:
-# server_configs:
-#   tikv:
-#     aa.b1.c3: value
-#     aa.b2.c4: value
-[config]
-item1 = 100
-item2 = 500
-[config.item3]
-item5 = 700
-item6 = 600
-
-[config2]
-itemx = "valuex"
-itemy = 1000
-[config2.item4]
-item7 = 700
-`
-
-	merge1, err := mergeImported(config, spec.ServerConfigs.TiKV)
-	c.Assert(err, IsNil)
-
-	merge2, err := merge2Toml(ComponentTiKV, merge1, spec.TiKVServers[0].Config)
-	c.Assert(err, IsNil)
-	c.Assert(string(merge2), DeepEquals, expected)
-}
-
-func (s *metaSuiteTopo) TestTiKVLabels(c *C) {
+func TestTiKVLabels(t *testing.T) {
 	spec := Specification{}
 	err := yaml.Unmarshal([]byte(`
 tikv_servers:
@@ -484,14 +510,14 @@ tikv_servers:
         zone: zone1
         host: host1
 `), &spec)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	labels, err := spec.TiKVServers[0].Labels()
-	c.Assert(err, IsNil)
-	c.Assert(labels, DeepEquals, map[string]string{
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
 		"dc":   "dc1",
 		"zone": "zone1",
 		"host": "host1",
-	})
+	}, labels)
 
 	spec = Specification{}
 	err = yaml.Unmarshal([]byte(`
@@ -502,34 +528,34 @@ tikv_servers:
       server.labels.zone: zone1
       server.labels.host: host1
 `), &spec)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	/*
 		labels, err = spec.TiKVServers[0].Labels()
-		c.Assert(err, IsNil)
-		c.Assert(labels, DeepEquals, map[string]string{
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{
 			"dc":   "dc1",
 			"zone": "zone1",
 			"host": "host1",
-		})
+		}, labels)
 	*/
 }
 
-func (s *metaSuiteTopo) TestLocationLabels(c *C) {
+func TestLocationLabels(t *testing.T) {
 	spec := Specification{}
 
 	lbs, err := spec.LocationLabels()
-	c.Assert(err, IsNil)
-	c.Assert(len(lbs), Equals, 0)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(lbs))
 
 	err = yaml.Unmarshal([]byte(`
 server_configs:
   pd:
     replication.location-labels: ["zone", "host"]
 `), &spec)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	lbs, err = spec.LocationLabels()
-	c.Assert(err, IsNil)
-	c.Assert(lbs, DeepEquals, []string{"zone", "host"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"zone", "host"}, lbs)
 
 	spec = Specification{}
 	err = yaml.Unmarshal([]byte(`
@@ -540,10 +566,10 @@ server_configs:
         - zone
         - host
 `), &spec)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	lbs, err = spec.LocationLabels()
-	c.Assert(err, IsNil)
-	c.Assert(lbs, DeepEquals, []string{"zone", "host"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"zone", "host"}, lbs)
 
 	spec = Specification{}
 	err = yaml.Unmarshal([]byte(`
@@ -555,12 +581,26 @@ pd_servers:
           - zone
           - host
 `), &spec)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	_, err = spec.LocationLabels()
-	c.Assert(err, NotNil)
+	require.Error(t, err)
 }
 
-func (s *metaSuiteTopo) TestTiFlashStorageSection(c *C) {
+func TestTiFlashRequiredCPUFlags(t *testing.T) {
+	obtained := getTiFlashRequiredCPUFlagsWithVersion("v6.3.0", "AMD64")
+	require.Equal(t, TiFlashRequiredCPUFlags, obtained)
+	obtained = getTiFlashRequiredCPUFlagsWithVersion("v6.3.0", "X86_64")
+	require.Equal(t, TiFlashRequiredCPUFlags, obtained)
+	obtained = getTiFlashRequiredCPUFlagsWithVersion("nightly", "amd64")
+	require.Equal(t, TiFlashRequiredCPUFlags, obtained)
+	obtained = getTiFlashRequiredCPUFlagsWithVersion("v6.3.0", "aarch64")
+	require.Equal(t, "", obtained)
+	obtained = getTiFlashRequiredCPUFlagsWithVersion("v6.2.0", "amd64")
+	require.Equal(t, "", obtained)
+}
+
+func TestTiFlashStorageSection(t *testing.T) {
+	ctx := context.Background()
 	spec := &Specification{}
 	err := yaml.Unmarshal([]byte(`
 tiflash_servers:
@@ -570,74 +610,71 @@ tiflash_servers:
       storage.main.dir: [/ssd0/tiflash, /ssd1/tiflash]
       storage.latest.dir: [/ssd0/tiflash]
 `), spec)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	flashComp := FindComponent(spec, ComponentTiFlash)
 	instances := flashComp.Instances()
-	c.Assert(len(instances), Equals, 1)
+	require.Equal(t, 1, len(instances))
 	// parse using clusterVersion<"v4.0.9"
 	{
 		ins := instances[0]
-		// This should be the same with tiflash_server instance's "data_dir"
-		dataDir := "/hdd0/tiflash,/hdd1/tiflash"
-		cfg := scripts.NewTiFlashScript(ins.GetHost(), "", dataDir, "", "", "")
-		conf, err := ins.(*TiFlashInstance).initTiFlashConfig(cfg, "v4.0.8", spec.ServerConfigs.TiFlash)
-		c.Assert(err, IsNil)
+		dataDirs := MultiDirAbs("", spec.TiFlashServers[0].DataDir)
+		conf, err := ins.(*TiFlashInstance).initTiFlashConfig(ctx, "v4.0.8", spec.ServerConfigs.TiFlash, meta.DirPaths{Deploy: spec.TiFlashServers[0].DeployDir, Data: dataDirs, Log: spec.TiFlashServers[0].LogDir})
+		require.NoError(t, err)
 
 		path, ok := conf["path"]
-		c.Assert(ok, IsTrue)
-		c.Assert(path, Equals, dataDir)
+		require.True(t, ok)
+		require.Equal(t, "/ssd0/tiflash,/ssd1/tiflash", path)
 	}
 	// parse using clusterVersion>="v4.0.9"
 	checkWithVersion := func(ver string) {
 		ins := instances[0].(*TiFlashInstance)
-		dataDir := "/ssd0/tiflash"
-		cfg := scripts.NewTiFlashScript(ins.GetHost(), "", dataDir, "", "", "")
-		conf, err := ins.initTiFlashConfig(cfg, ver, spec.ServerConfigs.TiFlash)
-		c.Assert(err, IsNil)
+		dataDirs := MultiDirAbs("", spec.TiFlashServers[0].DataDir)
+		conf, err := ins.initTiFlashConfig(ctx, ver, spec.ServerConfigs.TiFlash, meta.DirPaths{Deploy: spec.TiFlashServers[0].DeployDir, Data: dataDirs, Log: spec.TiFlashServers[0].LogDir})
+		require.NoError(t, err)
 
 		_, ok := conf["path"]
-		c.Assert(ok, IsTrue)
+		require.True(t, ok)
 
 		// After merging instance configurations with "storgae", the "path" property should be removed.
 		conf, err = ins.mergeTiFlashInstanceConfig(ver, conf, ins.InstanceSpec.(*TiFlashSpec).Config)
-		c.Assert(err, IsNil)
+		require.NoError(t, err)
 		_, ok = conf["path"]
-		c.Assert(ok, IsFalse)
+		require.False(t, ok)
 
 		if storageSection, ok := conf["storage"]; ok {
-			if mainSection, ok := storageSection.(map[string]interface{})["main"]; ok {
-				if mainDirsSection, ok := mainSection.(map[string]interface{})["dir"]; ok {
-					var mainDirs []interface{} = mainDirsSection.([]interface{})
-					c.Assert(len(mainDirs), Equals, 2)
-					c.Assert(mainDirs[0].(string), Equals, "/ssd0/tiflash")
-					c.Assert(mainDirs[1].(string), Equals, "/ssd1/tiflash")
+			if mainSection, ok := storageSection.(map[string]any)["main"]; ok {
+				if mainDirsSection, ok := mainSection.(map[string]any)["dir"]; ok {
+					mainDirs := mainDirsSection.([]any)
+					require.Equal(t, 2, len(mainDirs))
+					require.Equal(t, "/ssd0/tiflash", mainDirs[0].(string))
+					require.Equal(t, "/ssd1/tiflash", mainDirs[1].(string))
 				} else {
-					c.Error("Can not get storage.main.dir section")
+					t.Error("Can not get storage.main.dir section")
 				}
 			} else {
-				c.Error("Can not get storage.main section")
+				t.Error("Can not get storage.main section")
 			}
-			if latestSection, ok := storageSection.(map[string]interface{})["latest"]; ok {
-				if latestDirsSection, ok := latestSection.(map[string]interface{})["dir"]; ok {
-					var latestDirs []interface{} = latestDirsSection.([]interface{})
-					c.Assert(len(latestDirs), Equals, 1)
-					c.Assert(latestDirs[0].(string), Equals, "/ssd0/tiflash")
+			if latestSection, ok := storageSection.(map[string]any)["latest"]; ok {
+				if latestDirsSection, ok := latestSection.(map[string]any)["dir"]; ok {
+					latestDirs := latestDirsSection.([]any)
+					require.Equal(t, 1, len(latestDirs))
+					require.Equal(t, "/ssd0/tiflash", latestDirs[0].(string))
 				} else {
-					c.Error("Can not get storage.main.dir section")
+					t.Error("Can not get storage.main.dir section")
 				}
 			} else {
-				c.Error("Can not get storage.main section")
+				t.Error("Can not get storage.main section")
 			}
 		} else {
-			c.Error("Can not get storage section")
+			t.Error("Can not get storage section")
 		}
 	}
 	checkWithVersion("v4.0.9")
 	checkWithVersion("nightly")
 }
 
-func (s *metaSuiteTopo) TestTiFlashInvalidStorageSection(c *C) {
+func TestTiFlashInvalidStorageSection(t *testing.T) {
 	spec := &Specification{}
 
 	testCases := [][]byte{
@@ -680,40 +717,97 @@ tiflash_servers:
 
 	for _, testCase := range testCases {
 		err := yaml.Unmarshal(testCase, spec)
-		c.Check(err, NotNil)
+		require.Error(t, err)
 	}
 }
 
-func (s *metaSuiteTopo) TestTiFlashUsersSettings(c *C) {
+func TestTiCDCDataDir(t *testing.T) {
+	spec := &Specification{}
+	err := yaml.Unmarshal([]byte(`
+cdc_servers:
+  - host: 172.16.6.191
+    data_dir: /tidb-data/cdc-8300
+`), spec)
+	require.NoError(t, err)
+
+	cdcComp := FindComponent(spec, ComponentCDC)
+	instances := cdcComp.Instances()
+	require.Equal(t, 1, len(instances))
+
+	expected := map[string]struct {
+		configSupported  bool
+		dataDir          bool // data-dir is set
+		dataDirSupported bool
+	}{
+		"v4.0.12": {false, false, false},
+		"v4.0.13": {true, true, false},
+		"v4.0.14": {true, true, true},
+
+		"v5.0.0": {true, true, false},
+		"v5.0.1": {true, true, false},
+		"v5.0.2": {true, true, false},
+
+		"v5.0.3": {true, true, true},
+		"v5.1.0": {true, true, true},
+
+		"v5.0.0-rc":    {false, false, false},
+		"v6.0.0-alpha": {true, true, true},
+		"v6.1.0":       {true, true, true},
+		"v99.0.0":      {true, true, true},
+	}
+
+	checkByVersion := func(version string) {
+		ins := instances[0].(*CDCInstance)
+		cfg := &scripts.CDCScript{
+			DataDirEnabled:    tidbver.TiCDCSupportDataDir(version),
+			ConfigFileEnabled: tidbver.TiCDCSupportConfigFile(version),
+			TLSEnabled:        false,
+			DataDir:           utils.Ternary(tidbver.TiCDCSupportSortOrDataDir(version), ins.DataDir(), "").(string),
+		}
+
+		wanted := expected[version]
+
+		require.Equal(t, wanted.configSupported, cfg.ConfigFileEnabled, version)
+		require.Equal(t, wanted.dataDirSupported, cfg.DataDirEnabled, version)
+		require.Equal(t, wanted.dataDir, len(cfg.DataDir) != 0, version)
+	}
+
+	for k := range expected {
+		checkByVersion(k)
+	}
+}
+
+func TestTiFlashUsersSettings(t *testing.T) {
 	spec := &Specification{}
 	err := yaml.Unmarshal([]byte(`
 tiflash_servers:
   - host: 172.16.5.138
     data_dir: /ssd0/tiflash
 `), spec)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
 
 	flashComp := FindComponent(spec, ComponentTiFlash)
 	instances := flashComp.Instances()
-	c.Assert(len(instances), Equals, 1)
+	require.Equal(t, 1, len(instances))
 
 	// parse using clusterVersion<"v4.0.12" || == "5.0.0-rc"
 	checkBackwardCompatibility := func(ver string) {
 		ins := instances[0].(*TiFlashInstance)
-		dataDir := "/ssd0/tiflash"
-		cfg := scripts.NewTiFlashScript(ins.GetHost(), "", dataDir, "", "", "")
-		conf, err := ins.initTiFlashConfig(cfg, ver, spec.ServerConfigs.TiFlash)
-		c.Assert(err, IsNil)
+		dataDirs := MultiDirAbs("", spec.TiFlashServers[0].DataDir)
+		conf, err := ins.initTiFlashConfig(ctx, ver, spec.ServerConfigs.TiFlash, meta.DirPaths{Deploy: spec.TiFlashServers[0].DeployDir, Data: dataDirs, Log: spec.TiFlashServers[0].LogDir})
+		require.NoError(t, err)
 
 		// We need an empty string for 'users.default.password' for backward compatibility. Or the TiFlash process will fail to start with older versions
 		if usersSection, ok := conf["users"]; !ok {
-			c.Error("Can not get users section")
+			t.Error("Can not get users section")
 		} else {
-			if defaultUser, ok := usersSection.(map[string]interface{})["default"]; !ok {
-				c.Error("Can not get default users section")
+			if defaultUser, ok := usersSection.(map[string]any)["default"]; !ok {
+				t.Error("Can not get default users section")
 			} else {
-				var password = defaultUser.(map[string]interface{})["password"]
-				c.Assert(password.(string), Equals, "")
+				password := defaultUser.(map[string]any)["password"]
+				require.Equal(t, "", password.(string))
 			}
 		}
 	}
@@ -723,23 +817,22 @@ tiflash_servers:
 	// parse using clusterVersion>="v4.0.12"
 	checkWithVersion := func(ver string) {
 		ins := instances[0].(*TiFlashInstance)
-		dataDir := "/ssd0/tiflash"
-		cfg := scripts.NewTiFlashScript(ins.GetHost(), "", dataDir, "", "", "")
-		conf, err := ins.initTiFlashConfig(cfg, ver, spec.ServerConfigs.TiFlash)
-		c.Assert(err, IsNil)
+		dataDirs := MultiDirAbs("", spec.TiFlashServers[0].DataDir)
+		conf, err := ins.initTiFlashConfig(ctx, ver, spec.ServerConfigs.TiFlash, meta.DirPaths{Deploy: spec.TiFlashServers[0].DeployDir, Data: dataDirs, Log: spec.TiFlashServers[0].LogDir})
+		require.NoError(t, err)
 
 		// Those deprecated settings are ignored in newer versions
 		_, ok := conf["users"]
-		c.Assert(ok, IsFalse)
+		require.False(t, ok)
 	}
 	checkWithVersion("v4.0.12")
 	checkWithVersion("v5.0.0")
 	checkWithVersion("nightly")
 }
 
-func (s *metaSuiteTopo) TestYAMLAnchor(c *C) {
+func TestYAMLAnchor(t *testing.T) {
 	topo := Specification{}
-	err := yaml.UnmarshalStrict([]byte(`
+	decoder := yaml.NewDecoder(bytes.NewReader([]byte(`
 global:
   custom:
     tidb_spec: &tidb_spec
@@ -750,16 +843,18 @@ tidb_servers:
   - <<: *tidb_spec
     host: 172.16.5.138
     deploy_dir: "fake-deploy"
-`), &topo)
-	c.Assert(err, IsNil)
-	c.Assert(topo.TiDBServers[0].Host, Equals, "172.16.5.138")
-	c.Assert(topo.TiDBServers[0].DeployDir, Equals, "fake-deploy")
-	c.Assert(topo.TiDBServers[0].LogDir, Equals, "test-deploy/log")
+`)))
+	decoder.KnownFields(true)
+	err := decoder.Decode(&topo)
+	require.NoError(t, err)
+	require.Equal(t, "172.16.5.138", topo.TiDBServers[0].Host)
+	require.Equal(t, "fake-deploy", topo.TiDBServers[0].DeployDir)
+	require.Equal(t, "test-deploy/log", topo.TiDBServers[0].LogDir)
 }
 
-func (s *metaSuiteTopo) TestYAMLAnchorWithUndeclared(c *C) {
+func TestYAMLAnchorWithUndeclared(t *testing.T) {
 	topo := Specification{}
-	err := yaml.UnmarshalStrict([]byte(`
+	decoder := yaml.NewDecoder(bytes.NewReader([]byte(`
 global:
   custom:
     tidb_spec: &tidb_spec
@@ -770,7 +865,9 @@ global:
 tidb_servers:
   - <<: *tidb_spec
     host: 172.16.5.138
-`), &topo)
-	c.Assert(err, NotNil)
-	c.Assert(strings.Contains(err.Error(), "not found"), IsTrue)
+`)))
+	decoder.KnownFields(true)
+	err := decoder.Decode(&topo)
+	require.Error(t, err)
+	require.True(t, strings.Contains(err.Error(), "not found"))
 }

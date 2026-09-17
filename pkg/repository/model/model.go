@@ -15,15 +15,17 @@ package model
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	cjson "github.com/gibson042/canonicaljson-go"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/logger/log"
 	"github.com/pingcap/tiup/pkg/repository/store"
 	"github.com/pingcap/tiup/pkg/repository/v1manifest"
 	"github.com/pingcap/tiup/pkg/set"
 	"github.com/pingcap/tiup/pkg/utils"
+	"github.com/pingcap/tiup/pkg/version"
+	"go.uber.org/zap"
 )
 
 // Backend defines operations on the manifests
@@ -87,11 +89,11 @@ func (m *model) Grant(id, name string, key *v1manifest.KeyInfo) error {
 			return err
 		}
 
-		if indexFi, err := m.txn.Stat(fmt.Sprintf("%d.index.json", indexFileVersion.Version)); err == nil {
-			indexFileVersion.Length = uint(indexFi.Size())
-		} else {
+		indexFi, err := m.txn.Stat(fmt.Sprintf("%d.index.json", indexFileVersion.Version))
+		if err != nil {
 			return err
 		}
+		indexFileVersion.Length = uint(indexFi.Size())
 
 		if err := m.updateSnapshotManifest(initTime, func(om *v1manifest.Manifest) *v1manifest.Manifest {
 			signed := om.Signed.(*v1manifest.Snapshot)
@@ -132,10 +134,22 @@ func (m *model) Rotate(manifest *v1manifest.Manifest) error {
 			return err
 		}
 
+		// write new 'root.json' file with version prefix
 		manifestFilename := fmt.Sprintf("%d.root.json", root.Version)
 		if err := m.txn.WriteManifest(manifestFilename, manifest); err != nil {
 			return err
 		}
+		/* not yet update the 'root.json' without version prefix, as we don't
+		 * have a '1.root.json', so the 'root.json' is playing the role of initial
+		 * '1.root.json', clients are updating to the latest 'n.root.json' no
+		 * matter older ones are expired or not
+		 * maybe we could update the 'root.json' some day when we have many many
+		 * versions of root.json available and the updating process from old clients
+		 * are causing performance issues
+		 */
+		// if err := m.txn.WriteManifest("root.json", manifest); err != nil {
+		// 	return err
+		// }
 
 		fi, err := m.txn.Stat(manifestFilename)
 		if err != nil {
@@ -168,7 +182,7 @@ func (m *model) Rotate(manifest *v1manifest.Manifest) error {
 func (m *model) Publish(manifest *v1manifest.Manifest, info ComponentInfo) error {
 	signed := manifest.Signed.(*v1manifest.Component)
 	initTime := time.Now()
-	return utils.RetryUntil(func() error {
+	pf := func() error {
 		// Write the component manifest (component.json)
 		if err := m.updateComponentManifest(manifest); err != nil {
 			return err
@@ -184,7 +198,8 @@ func (m *model) Publish(manifest *v1manifest.Manifest, info ComponentInfo) error
 		var owner *v1manifest.Owner
 		if err := m.updateIndexManifest(initTime, func(im *v1manifest.Manifest) (*v1manifest.Manifest, error) {
 			// We only update index.json when it's a new component
-			// or the yanked, standalone, hidden fileds changed
+			// or the yanked, standalone, hidden fields changed,
+			// or the owner of component changed
 			var (
 				compItem  v1manifest.ComponentItem
 				compExist bool
@@ -194,9 +209,17 @@ func (m *model) Publish(manifest *v1manifest.Manifest, info ComponentInfo) error
 			signed := im.Signed.(*v1manifest.Index)
 			if compItem, compExist = signed.Components[componentName]; compExist {
 				// Find the owner of target component
-				o := signed.Owners[compItem.Owner]
+				var o v1manifest.Owner
+				if info.OwnerID() != "" {
+					o = signed.Owners[info.OwnerID()]
+				} else {
+					o = signed.Owners[compItem.Owner]
+				}
 				owner = &o
-				if info.Yanked() == nil && info.Hidden() == nil && info.Standalone() == nil {
+				if info.Yanked() == nil &&
+					info.Hidden() == nil &&
+					info.Standalone() == nil &&
+					info.OwnerID() == "" {
 					// No changes on index.json
 					return nil, nil
 				}
@@ -222,6 +245,9 @@ func (m *model) Publish(manifest *v1manifest.Manifest, info ComponentInfo) error
 			if info.Standalone() != nil {
 				compItem.Standalone = *info.Standalone()
 			}
+			if info.OwnerID() != "" {
+				compItem.Owner = info.OwnerID()
+			}
 
 			signed.Components[componentName] = compItem
 			indexFileVersion = &v1manifest.FileVersion{Version: signed.Version + 1}
@@ -235,11 +261,11 @@ func (m *model) Publish(manifest *v1manifest.Manifest, info ComponentInfo) error
 		}
 
 		if indexFileVersion != nil {
-			if indexFi, err := m.txn.Stat(fmt.Sprintf("%d.index.json", indexFileVersion.Version)); err == nil {
-				indexFileVersion.Length = uint(indexFi.Size())
-			} else {
+			indexFi, err := m.txn.Stat(fmt.Sprintf("%d.index.json", indexFileVersion.Version))
+			if err != nil {
 				return err
 			}
+			indexFileVersion.Length = uint(indexFi.Size())
 		}
 
 		if err := m.updateSnapshotManifest(initTime, func(om *v1manifest.Manifest) *v1manifest.Manifest {
@@ -267,11 +293,36 @@ func (m *model) Publish(manifest *v1manifest.Manifest, info ComponentInfo) error
 			if err := m.checkAndWrite(signed, info); err != nil {
 				return err
 			}
+			if signed.ID == version.TiUPVerName {
+				if err := m.copyTiUP(info.Filename()); err != nil {
+					return err
+				}
+			}
 		}
 		return m.txn.Commit()
-	}, func(err error) bool {
+	}
+
+	return utils.RetryUntil(pf, func(err error) bool {
 		return err == store.ErrorFsCommitConflict && m.txn.ResetManifest() == nil
 	})
+}
+
+func (m *model) copyTiUP(origin string) error {
+	xs := strings.Split(origin, "-")
+	if len(xs) < 4 {
+		return ErrorWrongFileName
+	}
+	// convert
+	//	`tiup-${version}-linux-arm64.tar.gz`  -> `tiup-linux-arm64.tar.gz`
+	//  `tiup-v1.4.0-darwin-amd64.tar.gz` -> `tiup-darwin-amd64.tar.gz`
+	//  `tiup-v1.4.0-r13-gcd19b75+staging-darwin-amd64.tar.gz` -> `tiup-darwin-amd64.tar.gz`
+	tiupTar := strings.Join(append(xs[:1], xs[len(xs)-2:]...), "-")
+	reader, err := m.txn.Read(origin)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	return m.txn.Write(tiupTar, reader)
 }
 
 func (m *model) checkAndWrite(manifest *v1manifest.Component, info ComponentData) error {
@@ -318,7 +369,11 @@ func (m *model) updateComponentManifest(manifest *v1manifest.Manifest) error {
 	snapSigned := snap.Signed.(*v1manifest.Snapshot)
 	lastVersion := snapSigned.Meta["/"+signed.Filename()].Version
 	if signed.Version != lastVersion+1 {
-		log.Debugf("Component version not expected, expect %d, got %d", lastVersion+1, signed.Version)
+		zap.L().Debug(
+			"Component version not expected",
+			zap.Uint("expected", lastVersion+1),
+			zap.Uint("got", signed.Version),
+		)
 		return ErrorConflict
 	}
 	return m.txn.WriteManifest(fmt.Sprintf("%d.%s.json", signed.Version, signed.ID), manifest)

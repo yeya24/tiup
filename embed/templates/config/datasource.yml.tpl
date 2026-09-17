@@ -1,14 +1,14 @@
 apiVersion: 1
-deleteDatasources:
-  - name: {{.ClusterName}}
 datasources:
-  - name: {{.ClusterName}}
-    type: prometheus
+{{- range .Datasources}}
+  - name: {{.Name}}
+    type: {{.Type}}
     access: proxy
-    url: http://{{.IP}}:{{.Port}}
+    url: {{.URL}}
     withCredentials: false
-    isDefault: false
+    isDefault: {{.IsDefault}}
     tlsAuth: false
     tlsAuthWithCACert: false
     version: 1
     editable: true
+{{- end}}

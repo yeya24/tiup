@@ -16,7 +16,6 @@ package command
 import (
 	"path"
 
-	"github.com/pingcap/tiup/pkg/cluster/executor"
 	"github.com/pingcap/tiup/pkg/cluster/manager"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/utils"
@@ -29,22 +28,30 @@ func newCheckCmd() *cobra.Command {
 		IdentityFile: path.Join(utils.UserHome(), ".ssh", "id_rsa"),
 	}
 	cmd := &cobra.Command{
-		Use:   "check <topology.yml | cluster-name>",
+		Use:   "check <topology.yml | cluster-name> [scale-out.yml]",
 		Short: "Perform preflight checks for the cluster.",
 		Long: `Perform preflight checks for the cluster. By default, it checks deploy servers
 before a cluster is deployed, the input is the topology.yaml for the cluster.
 If '--cluster' is set, it will perform checks for an existing cluster, the input
 is the cluster name. Some checks are ignore in this mode, such as port and dir
-conflict checks with other clusters`,
+conflict checks with other clusters
+If you want to check the scale-out topology, please use execute the following command
+'	check <cluster-name> <scale-out.yml> --cluster	'
+it will check the new instances `,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) != 1 {
+			if len(args) != 1 && len(args) != 2 {
 				return cmd.Help()
 			}
-			// natvie ssh has it's own logic to find the default identity_file
-			if gOpt.SSHType == executor.SSHTypeSystem && !utils.IsFlagSetByUser(cmd.Flags(), "identity_file") {
-				opt.IdentityFile = ""
+			scaleOutTopo := ""
+
+			if len(args) == 2 {
+				if !opt.ExistCluster {
+					return cmd.Help()
+				}
+				scaleOutTopo = args[1]
 			}
-			return cm.CheckCluster(args[0], opt, gOpt)
+
+			return cm.CheckCluster(args[0], scaleOutTopo, opt, gOpt)
 		},
 	}
 
@@ -60,6 +67,7 @@ conflict checks with other clusters`,
 	cmd.Flags().BoolVar(&opt.ApplyFix, "apply", false, "Try to fix failed checks")
 	cmd.Flags().BoolVar(&opt.ExistCluster, "cluster", false, "Check existing cluster, the input is a cluster name.")
 	cmd.Flags().Uint64Var(&gOpt.APITimeout, "api-timeout", 10, "Timeout in seconds when querying PD APIs.")
+	cmd.Flags().StringVarP(&opt.TempDir, "tempdir", "t", "/tmp/tiup", "The temporary directory.")
 
 	return cmd
 }

@@ -1,4 +1,4 @@
-// Copyright 2021 PingCAP, Inc.
+// Copyright 2023 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,10 @@ var (
 	// TiUPVerMajor is the major version of TiUP
 	TiUPVerMajor = 1
 	// TiUPVerMinor is the minor version of TiUP
-	TiUPVerMinor = 4
+	TiUPVerMinor = 17
 	// TiUPVerPatch is the patch version of TiUP
 	TiUPVerPatch = 1
-	// TiUPVerName is alternative name of the version
+	// TiUPVerName is an alternative name of the version
 	TiUPVerName = "tiup"
 	// GitHash is the current git commit hash
 	GitHash = "Unknown"

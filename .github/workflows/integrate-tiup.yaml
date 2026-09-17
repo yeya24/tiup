@@ -2,10 +2,14 @@
 name: integrate-tiup
 
 on:
+  schedule:
+    # times are in UTC
+    - cron: '19 21 * * *'
   pull_request:
     branches:
       - master
       - release-*
+      - feature/*
     paths-ignore:
       - '**.html'
       - '**.md'
@@ -32,74 +36,68 @@ on:
 
 jobs:
   tiup:
-    runs-on: ubuntu-latest
     timeout-minutes: 10
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: true
       matrix:
         cases:
           - "test_tiup"
-    env:
-      working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}
     steps:
-      - name: Set up Go 1.16
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.16.x
-        id: go
-
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          path: go/src/github.com/${{ github.repository }}
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+        id: go
+
 
       - name: Build build_tiup_test
-        working-directory: ${{ env.working-directory }}
         run: |
-          export GOPATH=${GITHUB_WORKSPACE}/go
           export PATH=$PATH:$GOPATH/bin
+          sudo apt update
+          sudo apt-get install -y build-essential
           make build_tiup_test
 
       - name: Run test suite
         id: test
-        working-directory: ${{ env.working-directory }}
         run: |
-          export PATH=$PATH:${{ env.working-directory }}/bin/
+          export PATH=$PATH:$PWD/bin
           echo $PATH
-          bash ${{ env.working-directory }}/tests/tiup/${{ matrix.cases }}.sh
+          bash ./tests/tiup/${{ matrix.cases }}.sh
 
       - name: Upload coverage to Codecov
-        working-directory: ${{ env.working-directory }}
-        run: |
-          curl -s https://codecov.io/bash | bash -s - -F integrate,tiup -s ${{ env.working-directory }}/tests/tiup/cover -f '*.out'
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./tests/tiup/cover/*out
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   unit-test:
     runs-on: ubuntu-latest
-    env:
-      working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}
     steps:
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          path: go/src/github.com/${{ github.repository }}
-
-      - name: Set up Go 1.16
-        uses: actions/setup-go@v2
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          go-version: 1.16.x
+          go-version-file: 'go.mod'
         id: go
 
       - name: make unit-test
-        working-directory: ${{ env.working-directory }}
         run: |
-          export GOPATH=${GITHUB_WORKSPACE}/go
           export PATH=$PATH:$GOPATH/bin
           make check
           make test
 
       - name: Upload coverage to Codecov
-        working-directory: ${{ env.working-directory }}
-        run: |
-          curl -s https://codecov.io/bash | bash -s - -F unittest -s cover -f '*.out'
+        uses: codecov/codecov-action@v5
+        with:
+          files: cover/*.out
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

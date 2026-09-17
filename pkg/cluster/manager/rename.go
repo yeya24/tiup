@@ -14,15 +14,17 @@
 package manager
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	"github.com/fatih/color"
-	"github.com/pingcap/tiup/pkg/cliutil"
 	"github.com/pingcap/tiup/pkg/cluster/clusterutil"
+	"github.com/pingcap/tiup/pkg/cluster/ctxt"
+	"github.com/pingcap/tiup/pkg/cluster/executor"
 	operator "github.com/pingcap/tiup/pkg/cluster/operation"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
-	"github.com/pingcap/tiup/pkg/logger/log"
+	"github.com/pingcap/tiup/pkg/tui"
 	"github.com/pingcap/tiup/pkg/utils"
 )
 
@@ -34,7 +36,7 @@ func (m *Manager) Rename(name string, opt operator.Options, newName string, skip
 	if !utils.IsExist(m.specManager.Path(name)) {
 		return errorRenameNameNotExist.
 			New("Cluster name '%s' not exist", name).
-			WithProperty(cliutil.SuggestionFromFormat("Please double check your cluster name"))
+			WithProperty(tui.SuggestionFromFormat("Please double check your cluster name"))
 	}
 
 	if err := clusterutil.ValidateClusterNameOrError(newName); err != nil {
@@ -43,18 +45,18 @@ func (m *Manager) Rename(name string, opt operator.Options, newName string, skip
 	if utils.IsExist(m.specManager.Path(newName)) {
 		return errorRenameNameDuplicate.
 			New("Cluster name '%s' is duplicated", newName).
-			WithProperty(cliutil.SuggestionFromFormat("Please specify another cluster name"))
+			WithProperty(tui.SuggestionFromFormat("Please specify another cluster name"))
 	}
 
 	if !skipConfirm {
-		if err := cliutil.PromptForConfirmOrAbortError(
-			fmt.Sprintf("Will rename the cluster name from %s to %s.\nDo you confirm this action? [y/N]:", color.HiYellowString(name), color.HiYellowString(newName)),
+		if err := tui.PromptForConfirmOrAbortError(
+			"%s", fmt.Sprintf("Will rename the cluster name from %s to %s.\nDo you confirm this action? [y/N]:", color.HiYellowString(name), color.HiYellowString(newName)),
 		); err != nil {
 			return err
 		}
 	}
 
-	_, err := m.meta(name)
+	metadata, err := m.meta(name)
 	if err != nil { // refuse renaming if current cluster topology is not valid
 		return err
 	}
@@ -63,8 +65,32 @@ func (m *Manager) Rename(name string, opt operator.Options, newName string, skip
 		return err
 	}
 
-	log.Infof("Rename cluster `%s` -> `%s` successfully", name, newName)
+	m.logger.Infof("Rename cluster `%s` -> `%s` successfully", name, newName)
+
+	if metadata.GetTopology().BaseTopo().GlobalOptions.TLSEnabled {
+		if err := m.refreshTLSAfterRename(newName, opt, metadata); err != nil {
+			return err
+		}
+	}
 
 	opt.Roles = []string{spec.ComponentGrafana, spec.ComponentPrometheus}
 	return m.Reload(newName, opt, false, skipConfirm)
+}
+
+func (m *Manager) refreshTLSAfterRename(name string, opt operator.Options, metadata spec.Metadata) error {
+	sshProxyProps := &tui.SSHConnectionProps{}
+	if opt.SSHType != executor.SSHTypeNone && len(opt.SSHProxyHost) != 0 {
+		var err error
+		sshProxyProps, err = tui.ReadIdentityFileOrPassword(opt.SSHProxyIdentity, opt.SSHProxyUsePassword)
+		if err != nil {
+			return err
+		}
+	}
+
+	t, err := buildTLSTask(m, name, metadata, opt, false, sshProxyProps, nil)
+	if err != nil {
+		return err
+	}
+	ctx := ctxt.New(context.Background(), opt.Concurrency, m.logger)
+	return t.Execute(ctx)
 }

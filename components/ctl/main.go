@@ -8,6 +8,8 @@ import (
 	"path"
 	"strings"
 
+	"slices"
+
 	"github.com/fatih/color"
 	"github.com/pingcap/tiup/pkg/localdata"
 	"github.com/pingcap/tiup/pkg/utils"
@@ -27,7 +29,7 @@ func execute() error {
 		return errors.New("component `ctl` cannot run in standalone mode")
 	}
 	rootCmd := &cobra.Command{
-		Use:                "tiup ctl {tidb/pd/tikv/binlog/etcd/cdc}",
+		Use:                "tiup ctl {tidb/pd/tikv/binlog/etcd/cdc/tidb-lightning}",
 		Short:              "TiDB controllers",
 		SilenceUsage:       true,
 		FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
@@ -48,12 +50,14 @@ func execute() error {
 			if ignoreVersion {
 				for i, arg := range transparentParams {
 					if arg == "--ignore-version" {
-						transparentParams = append(transparentParams[:i], transparentParams[i+1:]...)
+						transparentParams = slices.Delete(transparentParams, i, i+1)
 					}
 				}
 			} else if os.Getenv(localdata.EnvNameUserInputVersion) == "" {
 				// if user not set component version explicitly
-				return errors.New("ctl need an explicit version, please run with `tiup ctl:<cluster-version>`")
+				return errors.New(
+					"ctl needs an explicit version, please run with `tiup ctl:<cluster-version>`, if you continue seeing this error, please upgrade your TiUP with `tiup update --self`",
+				)
 			}
 
 			bin, err := binaryPath(home, componentSpec)
@@ -87,25 +91,19 @@ func execute() error {
 
 func binaryPath(home, cmd string) (string, error) {
 	switch cmd {
-	case "tidb", "tikv", "pd":
+	case "tidb", "tikv", "pd", "tidb-lightning":
 		return path.Join(home, cmd+"-ctl"), nil
 	case "binlog", "etcd":
 		return path.Join(home, cmd+"ctl"), nil
 	case "cdc":
 		return path.Join(home, cmd+" cli"), nil
 	default:
-		return "", errors.New("ctl only supports tidb, tikv, pd, binlog, etcd and cdc currently")
+		return "", errors.New("ctl only supports tidb, tikv, pd, binlog, tidb-lightning, etcd and cdc currently")
 	}
 }
 
 func run(name string, args ...string) error {
-	// Change the working directory to the same with TiUP working directory
-	if wd := os.Getenv(localdata.EnvNameWorkDir); wd != "" {
-		if err := os.Chdir(wd); err != nil {
-			return err
-		}
-	}
-
+	os.Setenv("ETCDCTL_API", "3")
 	// Handle `cdc cli`
 	if strings.Contains(name, " ") {
 		xs := strings.Split(name, " ")

@@ -7,17 +7,9 @@ DEPLOY_DIR={{.DeployDir}}
 
 cd "${DEPLOY_DIR}" || exit 1
 
-{{- define "PDList"}}
-  {{- range $idx, $pd := .}}
-    {{- if eq $idx 0}}
-      {{- $pd.IP}}:{{$pd.ClientPort}}
-    {{- else -}}
-      ,{{$pd.IP}}:{{$pd.ClientPort}}
-    {{- end}}
-  {{- end}}
-{{- end}}
-
-{{- if .NumaNode}}
+{{- if and .NumaNode .NumaCores}}
+exec numactl --cpunodebind={{.NumaNode}} --membind={{.NumaNode}} -C {{.NumaCores}} env GODEBUG=madvdontneed=1 bin/tidb-server \
+{{- else if .NumaNode}}
 exec numactl --cpunodebind={{.NumaNode}} --membind={{.NumaNode}} env GODEBUG=madvdontneed=1 bin/tidb-server \
 {{- else}}
 exec env GODEBUG=madvdontneed=1 bin/tidb-server \
@@ -27,7 +19,10 @@ exec env GODEBUG=madvdontneed=1 bin/tidb-server \
     --host="{{.ListenHost}}" \
     --advertise-address="{{.AdvertiseAddr}}" \
     --store="tikv" \
-    --path="{{template "PDList" .Endpoints}}" \
-    --log-slow-query="log/tidb_slow_query.log" \
+{{- if .SupportSecboot}}
+    --initialize-insecure \
+{{- end}}
+    --path="{{.PD}}" \
+    --log-slow-query="{{.LogDir}}/tidb_slow_query.log" \
     --config=conf/tidb.toml \
     --log-file="{{.LogDir}}/tidb.log" 2>> "{{.LogDir}}/tidb_stderr.log"

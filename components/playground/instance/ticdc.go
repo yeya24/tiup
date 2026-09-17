@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pingcap/tiup/pkg/tidbver"
 	"github.com/pingcap/tiup/pkg/utils"
 )
 
@@ -26,21 +27,24 @@ import (
 type TiCDC struct {
 	instance
 	pds []*PDInstance
-	Process
 }
 
 var _ Instance = &TiCDC{}
 
 // NewTiCDC create a TiCDC instance.
-func NewTiCDC(binPath string, dir, host, configPath string, id int, pds []*PDInstance) *TiCDC {
+func NewTiCDC(shOpt SharedOptions, binPath string, dir, host, configPath string, id int, port int, pds []*PDInstance) *TiCDC {
+	if port <= 0 {
+		port = 8300
+	}
 	ticdc := &TiCDC{
 		instance: instance{
 			BinPath:    binPath,
 			ID:         id,
 			Dir:        dir,
 			Host:       host,
-			Port:       utils.MustGetFreePort(host, 8300),
+			Port:       utils.MustGetFreePort(host, port, shOpt.PortOffset),
 			ConfigPath: configPath,
+			role:       "cdc",
 		},
 		pds: pds,
 	}
@@ -49,29 +53,29 @@ func NewTiCDC(binPath string, dir, host, configPath string, id int, pds []*PDIns
 }
 
 // Start implements Instance interface.
-func (c *TiCDC) Start(ctx context.Context, version utils.Version) error {
+func (c *TiCDC) Start(ctx context.Context) error {
 	endpoints := pdEndpoints(c.pds, true)
 
 	args := []string{
 		"server",
-		fmt.Sprintf("--addr=%s:%d", c.Host, c.Port),
-		fmt.Sprintf("--advertise-addr=%s:%d", AdvertiseHost(c.Host), c.Port),
+		fmt.Sprintf("--addr=%s", utils.JoinHostPort(c.Host, c.Port)),
+		fmt.Sprintf("--advertise-addr=%s", utils.JoinHostPort(AdvertiseHost(c.Host), c.Port)),
 		fmt.Sprintf("--pd=%s", strings.Join(endpoints, ",")),
 		fmt.Sprintf("--log-file=%s", c.LogFile()),
 	}
-
-	var err error
-	if c.Process, err = NewComponentProcess(ctx, c.Dir, c.BinPath, "cdc", version, args...); err != nil {
-		return err
+	clusterVersion := string(c.Version)
+	if tidbver.TiCDCSupportConfigFile(clusterVersion) {
+		if c.ConfigPath != "" {
+			args = append(args, fmt.Sprintf("--config=%s", c.ConfigPath))
+		}
+		if tidbver.TiCDCSupportDataDir(clusterVersion) {
+			args = append(args, fmt.Sprintf("--data-dir=%s", filepath.Join(c.Dir, "data")))
+		} else {
+			args = append(args, fmt.Sprintf("--sort-dir=%s/tmp/sorter", filepath.Join(c.Dir, "data")))
+		}
 	}
-	logIfErr(c.Process.SetOutputFile(c.LogFile()))
 
-	return c.Process.Start()
-}
-
-// Component return component name.
-func (c *TiCDC) Component() string {
-	return "ticdc"
+	return c.PrepareProcess(ctx, c.BinPath, args, nil, c.Dir)
 }
 
 // LogFile return the log file.

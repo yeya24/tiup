@@ -26,31 +26,26 @@ import (
 type Drainer struct {
 	instance
 	pds []*PDInstance
-	Process
 }
 
 var _ Instance = &Drainer{}
 
 // NewDrainer create a Drainer instance.
-func NewDrainer(binPath string, dir, host, configPath string, id int, pds []*PDInstance) *Drainer {
+func NewDrainer(shOpt SharedOptions, binPath string, dir, host, configPath string, id int, pds []*PDInstance) *Drainer {
 	d := &Drainer{
 		instance: instance{
 			BinPath:    binPath,
 			ID:         id,
 			Dir:        dir,
 			Host:       host,
-			Port:       utils.MustGetFreePort(host, 8250),
+			Port:       utils.MustGetFreePort(host, 8250, shOpt.PortOffset),
 			ConfigPath: configPath,
+			role:       "drainer",
 		},
 		pds: pds,
 	}
 	d.StatusPort = d.Port
 	return d
-}
-
-// Component return component name.
-func (d *Drainer) Component() string {
-	return "drainer"
 }
 
 // LogFile return the log file name.
@@ -60,22 +55,17 @@ func (d *Drainer) LogFile() string {
 
 // Addr return the address of Drainer.
 func (d *Drainer) Addr() string {
-	return fmt.Sprintf("%s:%d", AdvertiseHost(d.Host), d.Port)
-}
-
-// NodeID return the node id of drainer.
-func (d *Drainer) NodeID() string {
-	return fmt.Sprintf("drainer_%d", d.ID)
+	return utils.JoinHostPort(AdvertiseHost(d.Host), d.Port)
 }
 
 // Start implements Instance interface.
-func (d *Drainer) Start(ctx context.Context, version utils.Version) error {
+func (d *Drainer) Start(ctx context.Context) error {
 	endpoints := pdEndpoints(d.pds, true)
 
 	args := []string{
-		fmt.Sprintf("--node-id=%s", d.NodeID()),
-		fmt.Sprintf("--addr=%s:%d", d.Host, d.Port),
-		fmt.Sprintf("--advertise-addr=%s:%d", AdvertiseHost(d.Host), d.Port),
+		fmt.Sprintf("--node-id=%s", d.Name()),
+		fmt.Sprintf("--addr=%s", utils.JoinHostPort(d.Host, d.Port)),
+		fmt.Sprintf("--advertise-addr=%s", utils.JoinHostPort(AdvertiseHost(d.Host), d.Port)),
 		fmt.Sprintf("--pd-urls=%s", strings.Join(endpoints, ",")),
 		fmt.Sprintf("--log-file=%s", d.LogFile()),
 	}
@@ -83,11 +73,5 @@ func (d *Drainer) Start(ctx context.Context, version utils.Version) error {
 		args = append(args, fmt.Sprintf("--config=%s", d.ConfigPath))
 	}
 
-	var err error
-	if d.Process, err = NewComponentProcess(ctx, d.Dir, d.BinPath, "drainer", version, args...); err != nil {
-		return err
-	}
-	logIfErr(d.Process.SetOutputFile(d.LogFile()))
-
-	return d.Process.Start()
+	return d.PrepareProcess(ctx, d.BinPath, args, nil, d.Dir)
 }

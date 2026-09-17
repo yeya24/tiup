@@ -16,38 +16,74 @@ package localdata
 import (
 	"os"
 	"path"
+	"path/filepath"
 	"testing"
 
-	"github.com/google/uuid"
-	"github.com/pingcap/check"
 	"github.com/pingcap/tiup/pkg/utils"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = check.Suite(&profileTestSuite{})
-
-type profileTestSuite struct{}
-
-func TestProfile(t *testing.T) {
-	check.TestingT(t)
-}
-
-func (s *profileTestSuite) TestResetMirror(c *check.C) {
-	uuid := uuid.New().String()
-	root := path.Join("/tmp", uuid)
-	_ = os.Mkdir(root, 0755)
-	_ = os.Mkdir(path.Join(root, "bin"), 0755)
-	defer os.RemoveAll(root)
+func TestResetMirror(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(path.Join(root, "bin"), 0o755))
 
 	cfg, _ := InitConfig(root)
 	profile := NewProfile(root, cfg)
 
-	c.Assert(profile.ResetMirror("https://tiup-mirrors.pingcap.com", ""), check.IsNil)
-	c.Assert(profile.ResetMirror("https://example.com", ""), check.NotNil)
-	c.Assert(profile.ResetMirror("https://example.com", "https://tiup-mirrors.pingcap.com/root.json"), check.IsNil)
+	require.NoError(t, profile.ResetMirror("https://tiup-mirrors.pingcap.com", ""))
+	require.Error(t, profile.ResetMirror("https://example.com", ""))
+	require.NoError(t, profile.ResetMirror("https://example.com", "https://tiup-mirrors.pingcap.com/root.json"))
 
-	c.Assert(utils.Copy(path.Join(root, "bin"), path.Join(root, "mock-mirror")), check.IsNil)
+	require.NoError(t, utils.Copy(path.Join(root, "bin"), path.Join(root, "mock-mirror")))
 
-	c.Assert(profile.ResetMirror(path.Join(root, "mock-mirror"), ""), check.IsNil)
-	c.Assert(profile.ResetMirror(root, ""), check.NotNil)
-	c.Assert(profile.ResetMirror(root, path.Join(root, "mock-mirror", "root.json")), check.IsNil)
+	require.NoError(t, profile.ResetMirror(path.Join(root, "mock-mirror"), ""))
+	require.Error(t, profile.ResetMirror(root, ""))
+	require.NoError(t, profile.ResetMirror(root, path.Join(root, "mock-mirror", "root.json")))
+}
+
+func TestWriteMetaFile_abs(t *testing.T) {
+	tmpdir := t.TempDir()
+
+	instance := filepath.Join(tmpdir, "testinstance")
+	cfg, _ := InitConfig(tmpdir)
+	profile := NewProfile(tmpdir, cfg)
+
+	p := Process{}
+	err := profile.WriteMetaFile(instance, &p)
+	require.NoError(t, err)
+
+	_, err = os.Stat(instance)
+	require.NoError(t, err)
+}
+
+func TestWriteMetaFile_rel(t *testing.T) {
+	tmpdir := t.TempDir()
+
+	instance := "testinstance"
+	cfg, _ := InitConfig(tmpdir)
+	profile := NewProfile(tmpdir, cfg)
+
+	p := Process{}
+	err := profile.WriteMetaFile(instance, &p)
+	require.NoError(t, err)
+
+	_, err = os.Stat(profile.Path(instance))
+	require.NoError(t, err)
+}
+
+func TestWriteMetaFile_readback(t *testing.T) {
+	tmpdir := t.TempDir()
+
+	instance := filepath.Join(tmpdir, DataParentDir, "testinstance")
+	cfg, _ := InitConfig(tmpdir)
+	profile := NewProfile(tmpdir, cfg)
+
+	p := Process{}
+	err := profile.WriteMetaFile(instance, &p)
+	require.NoError(t, err)
+
+	p2, err := profile.ReadMetaFile(filepath.Base(instance))
+	require.NoError(t, err)
+	require.NotNil(t, p2)
+	require.Equal(t, p, *p2)
 }

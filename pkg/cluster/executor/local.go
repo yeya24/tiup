@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/pingcap/tiup/pkg/cliutil"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
+	"github.com/pingcap/tiup/pkg/tui"
 	"github.com/pingcap/tiup/pkg/utils"
 	"go.uber.org/zap"
 )
@@ -41,15 +41,23 @@ var _ ctxt.Executor = &Local{}
 
 // Execute implements Executor interface.
 func (l *Local) Execute(ctx context.Context, cmd string, sudo bool, timeout ...time.Duration) ([]byte, []byte, error) {
+	// change wd to default home
+	cmd = fmt.Sprintf("cd; %s", cmd)
+	// get current user name
+	user, err := user.Current()
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// try to acquire root permission
 	if l.Sudo || sudo {
-		cmd = fmt.Sprintf("sudo -H -u root bash -c 'cd; %s'", cmd)
-	} else {
-		cmd = fmt.Sprintf("sudo -H -u %s bash -c 'cd; %s'", l.Config.User, cmd)
+		cmd = fmt.Sprintf("/usr/bin/sudo -H -u root bash -c \"%s\"", strings.ReplaceAll(cmd, "\"", "\\\""))
+	} else if l.Config.User != user.Name {
+		cmd = fmt.Sprintf("/usr/bin/sudo -H -u %s bash -c \"%s\"", l.Config.User, strings.ReplaceAll(cmd, "\"", "\\\""))
 	}
 
 	// set a basic PATH in case it's empty on login
-	cmd = fmt.Sprintf("PATH=$PATH:/usr/bin:/usr/sbin %s", cmd)
+	cmd = fmt.Sprintf("PATH=$PATH:/bin:/sbin:/usr/bin:/usr/sbin %s", cmd)
 
 	if l.Locale != "" {
 		cmd = fmt.Sprintf("export LANG=%s; %s", l.Locale, cmd)
@@ -67,14 +75,14 @@ func (l *Local) Execute(ctx context.Context, cmd string, sudo bool, timeout ...t
 		defer cancel()
 	}
 
-	command := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+	command := exec.CommandContext(ctx, "/bin/bash", "-c", cmd)
 
 	stdout := new(bytes.Buffer)
 	stderr := new(bytes.Buffer)
 	command.Stdout = stdout
 	command.Stderr = stderr
 
-	err := command.Run()
+	err = command.Run()
 
 	zap.L().Info("LocalCommand",
 		zap.String("cmd", cmd),
@@ -91,7 +99,7 @@ func (l *Local) Execute(ctx context.Context, cmd string, sudo bool, timeout ...t
 		if len(stdout.Bytes()) > 0 || len(stderr.Bytes()) > 0 {
 			output := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
 			baseErr = baseErr.
-				WithProperty(cliutil.SuggestionFromFormat("Command output:\n%s\n", color.YellowString(output)))
+				WithProperty(tui.SuggestionFromFormat("Command output:\n%s\n", color.YellowString(output)))
 		}
 		return stdout.Bytes(), stderr.Bytes(), baseErr
 	}
@@ -100,9 +108,9 @@ func (l *Local) Execute(ctx context.Context, cmd string, sudo bool, timeout ...t
 }
 
 // Transfer implements Executer interface.
-func (l *Local) Transfer(ctx context.Context, src string, dst string, download bool) error {
+func (l *Local) Transfer(ctx context.Context, src, dst string, download bool, limit int, _ bool) error {
 	targetPath := filepath.Dir(dst)
-	if err := utils.CreateDir(targetPath); err != nil {
+	if err := utils.MkdirAll(targetPath, 0755); err != nil {
 		return err
 	}
 
@@ -114,10 +122,10 @@ func (l *Local) Transfer(ctx context.Context, src string, dst string, download b
 	if download || user.Username == l.Config.User {
 		cmd = fmt.Sprintf("cp %s %s", src, dst)
 	} else {
-		cmd = fmt.Sprintf("sudo -H -u root bash -c \"cp %[1]s %[2]s && chown %[3]s:$(id -g -n %[3]s) %[2]s\"", src, dst, l.Config.User)
+		cmd = fmt.Sprintf("/usr/bin/sudo -H -u root bash -c \"cp %[1]s %[2]s && chown %[3]s:$(id -g -n %[3]s) %[2]s\"", src, dst, l.Config.User)
 	}
 
-	command := exec.Command("/bin/sh", "-c", cmd)
+	command := exec.Command("/bin/bash", "-c", cmd)
 	stdout := new(bytes.Buffer)
 	stderr := new(bytes.Buffer)
 	command.Stdout = stdout
@@ -140,7 +148,7 @@ func (l *Local) Transfer(ctx context.Context, src string, dst string, download b
 		if len(stdout.Bytes()) > 0 || len(stderr.Bytes()) > 0 {
 			output := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
 			baseErr = baseErr.
-				WithProperty(cliutil.SuggestionFromFormat("Command output:\n%s\n", color.YellowString(output)))
+				WithProperty(tui.SuggestionFromFormat("Command output:\n%s\n", color.YellowString(output)))
 		}
 		return baseErr
 	}

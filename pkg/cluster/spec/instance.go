@@ -31,6 +31,7 @@ import (
 	"github.com/pingcap/tiup/pkg/cluster/module"
 	system "github.com/pingcap/tiup/pkg/cluster/template/systemd"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/utils"
 	"go.uber.org/zap"
 )
 
@@ -38,19 +39,26 @@ import (
 const (
 	ComponentTiDB             = "tidb"
 	ComponentTiKV             = "tikv"
+	ComponentTiKVWorker       = "tikv-worker"
 	ComponentPD               = "pd"
+	ComponentTSO              = "tso"
+	ComponentScheduling       = "scheduling"
+	ComponentRouter           = "router"
+	ComponentResourceManager  = "resource-manager"
 	ComponentTiFlash          = "tiflash"
+	ComponentTiProxy          = "tiproxy"
 	ComponentGrafana          = "grafana"
 	ComponentDrainer          = "drainer"
+	ComponentDashboard        = "tidb-dashboard"
 	ComponentPump             = "pump"
 	ComponentCDC              = "cdc"
+	ComponentTiKVCDC          = "tikv-cdc"
 	ComponentTiSpark          = "tispark"
 	ComponentSpark            = "spark"
 	ComponentAlertmanager     = "alertmanager"
 	ComponentDMMaster         = "dm-master"
 	ComponentDMWorker         = "dm-worker"
 	ComponentPrometheus       = "prometheus"
-	ComponentPushwaygate      = "pushgateway"
 	ComponentBlackboxExporter = "blackbox_exporter"
 	ComponentNodeExporter     = "node_exporter"
 	ComponentCheckCollector   = "insight"
@@ -67,41 +75,58 @@ var (
 type Component interface {
 	Name() string
 	Role() string
+	Source() string
 	Instances() []Instance
+	CalculateVersion(string) string
+	SetVersion(string)
+}
+
+// UpdateConfig is used to control behavior pre/post hook of instances.
+type UpdateConfig struct {
+	CurrentVersion string
+	TargetVersion  string
 }
 
 // RollingUpdateInstance represent a instance need to transfer state when restart.
 // e.g transfer leader.
 type RollingUpdateInstance interface {
-	PreRestart(topo Topology, apiTimeoutSeconds int, tlsCfg *tls.Config) error
-	PostRestart(topo Topology, tlsCfg *tls.Config) error
+	PreRestart(ctx context.Context, topo Topology, apiTimeoutSeconds int, tlsCfg *tls.Config, extra *UpdateConfig) error
+	PostRestart(ctx context.Context, topo Topology, tlsCfg *tls.Config, extra *UpdateConfig) error
 }
 
 // Instance represents the instance.
 type Instance interface {
 	InstanceSpec
 	ID() string
-	Ready(context.Context, ctxt.Executor, uint64) error
+	Ready(context.Context, ctxt.Executor, uint64, *tls.Config) error
 	InitConfig(ctx context.Context, e ctxt.Executor, clusterName string, clusterVersion string, deployUser string, paths meta.DirPaths) error
 	ScaleConfig(ctx context.Context, e ctxt.Executor, topo Topology, clusterName string, clusterVersion string, deployUser string, paths meta.DirPaths) error
 	PrepareStart(ctx context.Context, tlsCfg *tls.Config) error
 	ComponentName() string
+	ComponentSource() string
 	InstanceName() string
 	ServiceName() string
+	ResourceControl() meta.ResourceControl
 	GetHost() string
+	GetManageHost() string
 	GetPort() int
 	GetSSHPort() int
+	GetNumaNode() string
+	GetNumaCores() string
 	DeployDir() string
 	UsedPorts() []int
 	UsedDirs() []string
-	Status(tlsCfg *tls.Config, pdList ...string) string
-	Uptime(tlsCfg *tls.Config) time.Duration
+	Status(ctx context.Context, timeout time.Duration, tlsCfg *tls.Config, pdList ...string) string
+	Uptime(ctx context.Context, timeout time.Duration, tlsCfg *tls.Config) time.Duration
 	DataDir() string
 	LogDir() string
 	OS() string // only linux supported now
 	Arch() string
 	IsPatched() bool
 	SetPatched(bool)
+	CalculateVersion(string) string
+	// SetVersion(string)
+	setTLSConfig(ctx context.Context, enableTLS bool, configs map[string]any, paths meta.DirPaths) (map[string]any, error)
 }
 
 // PortStarted wait until a port is being listened
@@ -132,18 +157,24 @@ type BaseInstance struct {
 
 	Name       string
 	Host       string
+	ManageHost string
 	ListenHost string
 	Port       int
 	SSHP       int
+	Source     string
+	NumaNode   string
+	NumaCores  string
 
 	Ports    []int
 	Dirs     []string
-	StatusFn func(tlsCfg *tls.Config, pdHosts ...string) string
-	UptimeFn func(tlsCfg *tls.Config) time.Duration
+	StatusFn func(ctx context.Context, timeout time.Duration, tlsCfg *tls.Config, pdHosts ...string) string
+	UptimeFn func(ctx context.Context, timeout time.Duration, tlsCfg *tls.Config) time.Duration
+
+	Component Component
 }
 
 // Ready implements Instance interface
-func (i *BaseInstance) Ready(ctx context.Context, e ctxt.Executor, timeout uint64) error {
+func (i *BaseInstance) Ready(ctx context.Context, e ctxt.Executor, timeout uint64, _ *tls.Config) error {
 	return PortStarted(ctx, e, i.Port, timeout)
 }
 
@@ -155,7 +186,7 @@ func (i *BaseInstance) InitConfig(ctx context.Context, e ctxt.Executor, opt Glob
 	sysCfg := filepath.Join(paths.Cache, fmt.Sprintf("%s-%s-%d.service", comp, host, port))
 
 	// insert checkpoint
-	point := checkpoint.Acquire(ctx, CopyConfigFile, map[string]interface{}{"config-file": sysCfg})
+	point := checkpoint.Acquire(ctx, CopyConfigFile, map[string]any{"config-file": sysCfg})
 	defer func() {
 		point.Release(err, zap.String("config-file", sysCfg))
 	}()
@@ -164,13 +195,21 @@ func (i *BaseInstance) InitConfig(ctx context.Context, e ctxt.Executor, opt Glob
 		return nil
 	}
 
-	resource := MergeResourceControl(opt.ResourceControl, i.resourceControl())
+	systemdMode := opt.SystemdMode
+	if len(systemdMode) == 0 {
+		systemdMode = SystemMode
+	}
+
+	resource := MergeResourceControl(opt.ResourceControl, i.ResourceControl())
 	systemCfg := system.NewConfig(comp, user, paths.Deploy).
 		WithMemoryLimit(resource.MemoryLimit).
 		WithCPUQuota(resource.CPUQuota).
 		WithLimitCORE(resource.LimitCORE).
+		WithTimeoutStartSec(resource.TimeoutStartSec).
+		WithTimeoutStopSec(resource.TimeoutStopSec).
 		WithIOReadBandwidthMax(resource.IOReadBandwidthMax).
-		WithIOWriteBandwidthMax(resource.IOWriteBandwidthMax)
+		WithIOWriteBandwidthMax(resource.IOWriteBandwidthMax).
+		WithSystemdMode(string(systemdMode))
 
 	// For not auto start if using binlogctl to offline.
 	// bad design
@@ -182,15 +221,41 @@ func (i *BaseInstance) InitConfig(ctx context.Context, e ctxt.Executor, opt Glob
 		return errors.Trace(err)
 	}
 	tgt := filepath.Join("/tmp", comp+"_"+uuid.New().String()+".service")
-	if err := e.Transfer(ctx, sysCfg, tgt, false); err != nil {
+	if err := e.Transfer(ctx, sysCfg, tgt, false, 0, false); err != nil {
 		return errors.Annotatef(err, "transfer from %s to %s failed", sysCfg, tgt)
 	}
-	cmd := fmt.Sprintf("mv %s /etc/systemd/system/%s-%d.service", tgt, comp, port)
-	if _, _, err := e.Execute(ctx, cmd, true); err != nil {
+	systemdDir := "/etc/systemd/system/"
+	sudo := true
+	if opt.SystemdMode == UserMode {
+		systemdDir = "~/.config/systemd/user/"
+		sudo = false
+	}
+	cmd := fmt.Sprintf("mv %s %s%s-%d.service", tgt, systemdDir, comp, port)
+	if _, _, err := e.Execute(ctx, cmd, sudo); err != nil {
 		return errors.Annotatef(err, "execute: %s", cmd)
 	}
 
+	// restorecon restores SELinux Contexts
+	// Check with: ls -lZ /path/to/file
+	// If the context is wrong systemctl will complain about a missing unit file
+	// Note that we won't check for errors here because:
+	// - We don't support SELinux in Enforcing mode
+	// - restorecon might not be available (Ubuntu doesn't install SELinux tools by default)
+	cmd = fmt.Sprintf("restorecon %s%s-%d.service", systemdDir, comp, port)
+	e.Execute(ctx, cmd, sudo) //nolint
+
+	// doesn't work
+	if _, err := i.setTLSConfig(ctx, false, nil, paths); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// setTLSConfig set TLS Config to support enable/disable TLS
+// baseInstance no need to configure TLS
+func (i *BaseInstance) setTLSConfig(ctx context.Context, enableTLS bool, configs map[string]any, paths meta.DirPaths) (map[string]any, error) {
+	return nil, nil
 }
 
 // TransferLocalConfigFile scp local config file to remote
@@ -203,7 +268,7 @@ func (i *BaseInstance) TransferLocalConfigFile(ctx context.Context, e ctxt.Execu
 		return errors.Annotatef(err, "execute: %s", cmd)
 	}
 
-	if err := e.Transfer(ctx, local, remote, false); err != nil {
+	if err := e.Transfer(ctx, local, remote, false, 0, false); err != nil {
 		return errors.Annotatef(err, "transfer from %s to %s failed", local, remote)
 	}
 
@@ -243,45 +308,55 @@ func (i *BaseInstance) IteratorLocalConfigDir(ctx context.Context, local string,
 }
 
 // MergeServerConfig merges the server configuration and overwrite the global configuration
-func (i *BaseInstance) MergeServerConfig(ctx context.Context, e ctxt.Executor, globalConf, instanceConf map[string]interface{}, paths meta.DirPaths) error {
+func (i *BaseInstance) MergeServerConfig(ctx context.Context, e ctxt.Executor, globalConf, instanceConf map[string]any, paths meta.DirPaths) error {
 	fp := filepath.Join(paths.Cache, fmt.Sprintf("%s-%s-%d.toml", i.ComponentName(), i.GetHost(), i.GetPort()))
-	conf, err := merge2Toml(i.ComponentName(), globalConf, instanceConf)
+	conf, err := Merge2Toml(i.ComponentName(), globalConf, instanceConf)
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(fp, conf, os.ModePerm)
+	err = utils.WriteFile(fp, conf, os.ModePerm)
 	if err != nil {
 		return err
 	}
 	dst := filepath.Join(paths.Deploy, "conf", fmt.Sprintf("%s.toml", i.ComponentName()))
 	// transfer config
-	return e.Transfer(ctx, fp, dst, false)
+	return e.Transfer(ctx, fp, dst, false, 0, false)
 }
 
 // mergeTiFlashLearnerServerConfig merges the server configuration and overwrite the global configuration
-func (i *BaseInstance) mergeTiFlashLearnerServerConfig(ctx context.Context, e ctxt.Executor, globalConf, instanceConf map[string]interface{}, paths meta.DirPaths) error {
+func (i *BaseInstance) mergeTiFlashLearnerServerConfig(ctx context.Context, e ctxt.Executor, globalConf, instanceConf map[string]any, paths meta.DirPaths) error {
 	fp := filepath.Join(paths.Cache, fmt.Sprintf("%s-learner-%s-%d.toml", i.ComponentName(), i.GetHost(), i.GetPort()))
-	conf, err := merge2Toml(i.ComponentName()+"-learner", globalConf, instanceConf)
+	conf, err := Merge2Toml(i.ComponentName()+"-learner", globalConf, instanceConf)
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(fp, conf, os.ModePerm)
+	err = utils.WriteFile(fp, conf, os.ModePerm)
 	if err != nil {
 		return err
 	}
 	dst := filepath.Join(paths.Deploy, "conf", fmt.Sprintf("%s-learner.toml", i.ComponentName()))
 	// transfer config
-	return e.Transfer(ctx, fp, dst, false)
+	return e.Transfer(ctx, fp, dst, false, 0, false)
 }
 
 // ID returns the identifier of this instance, the ID is constructed by host:port
 func (i *BaseInstance) ID() string {
-	return fmt.Sprintf("%s:%d", i.Host, i.Port)
+	return utils.JoinHostPort(i.Host, i.Port)
 }
 
 // ComponentName implements Instance interface
 func (i *BaseInstance) ComponentName() string {
 	return i.Name
+}
+
+// ComponentSource implements Instance interface
+func (i *BaseInstance) ComponentSource() string {
+	if i.Source != "" {
+		return i.Source
+	} else if i.Component.Source() != "" {
+		return i.Component.Source()
+	}
+	return i.ComponentName()
 }
 
 // InstanceName implements Instance interface
@@ -312,9 +387,21 @@ func (i *BaseInstance) GetHost() string {
 	return i.Host
 }
 
+// GetManageHost implements Instance interface
+func (i *BaseInstance) GetManageHost() string {
+	if i.ManageHost != "" {
+		return i.ManageHost
+	}
+	return i.Host
+}
+
 // GetListenHost implements Instance interface
 func (i *BaseInstance) GetListenHost() string {
 	if i.ListenHost == "" {
+		// ipv6 address
+		if strings.Contains(i.Host, ":") {
+			return "::"
+		}
 		return "0.0.0.0"
 	}
 	return i.ListenHost
@@ -325,9 +412,24 @@ func (i *BaseInstance) GetSSHPort() int {
 	return i.SSHP
 }
 
+// GetNumaNode implements Instance interface
+func (i *BaseInstance) GetNumaNode() string {
+	return i.NumaNode
+}
+
+// GetNumaCores implements Instance interface
+func (i *BaseInstance) GetNumaCores() string {
+	return i.NumaCores
+}
+
 // DeployDir implements Instance interface
 func (i *BaseInstance) DeployDir() string {
 	return reflect.Indirect(reflect.ValueOf(i.InstanceSpec)).FieldByName("DeployDir").String()
+}
+
+// TLSDir implements Instance interface
+func (i *BaseInstance) TLSDir() string {
+	return i.DeployDir()
 }
 
 // DataDir implements Instance interface
@@ -399,6 +501,11 @@ func (i *BaseInstance) SetPatched(p bool) {
 	v.SetBool(p)
 }
 
+// CalculateVersion implements the Instance interface
+func (i *BaseInstance) CalculateVersion(globalVersion string) string {
+	return i.Component.CalculateVersion(globalVersion)
+}
+
 // PrepareStart checks instance requirements before starting
 func (i *BaseInstance) PrepareStart(ctx context.Context, tlsCfg *tls.Config) error {
 	return nil
@@ -421,10 +528,17 @@ func MergeResourceControl(lhs, rhs meta.ResourceControl) meta.ResourceControl {
 	if rhs.LimitCORE != "" {
 		lhs.LimitCORE = rhs.LimitCORE
 	}
+	if rhs.TimeoutStartSec != "" {
+		lhs.TimeoutStartSec = rhs.TimeoutStartSec
+	}
+	if rhs.TimeoutStopSec != "" {
+		lhs.TimeoutStopSec = rhs.TimeoutStopSec
+	}
 	return lhs
 }
 
-func (i *BaseInstance) resourceControl() meta.ResourceControl {
+// ResourceControl return cgroups config of instance
+func (i *BaseInstance) ResourceControl() meta.ResourceControl {
 	if v := reflect.Indirect(reflect.ValueOf(i.InstanceSpec)).FieldByName("ResourceControl"); v.IsValid() {
 		return v.Interface().(meta.ResourceControl)
 	}
@@ -447,11 +561,11 @@ func (i *BaseInstance) UsedDirs() []string {
 }
 
 // Status implements Instance interface
-func (i *BaseInstance) Status(tlsCfg *tls.Config, pdList ...string) string {
-	return i.StatusFn(tlsCfg, pdList...)
+func (i *BaseInstance) Status(ctx context.Context, timeout time.Duration, tlsCfg *tls.Config, pdList ...string) string {
+	return i.StatusFn(ctx, timeout, tlsCfg, pdList...)
 }
 
 // Uptime implements Instance interface
-func (i *BaseInstance) Uptime(tlsCfg *tls.Config) time.Duration {
-	return i.UptimeFn(tlsCfg)
+func (i *BaseInstance) Uptime(ctx context.Context, timeout time.Duration, tlsCfg *tls.Config) time.Duration {
+	return i.UptimeFn(ctx, timeout, tlsCfg)
 }

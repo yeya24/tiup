@@ -31,11 +31,11 @@ const (
 
 // ValidateErr is the error when meta validation fails with conflicts
 type ValidateErr struct {
-	Type   string      // conflict type
-	Target string      // conflict Target
-	Value  interface{} // conflict Value
-	LHS    string      // object 1
-	RHS    string      // object 2
+	Type   string // conflict type
+	Target string // conflict Target
+	Value  any    // conflict Value
+	LHS    string // object 1
+	RHS    string // object 2
 }
 
 // Error implements the error interface
@@ -60,7 +60,7 @@ func (e *ValidateErr) Is(target error) bool {
 	}
 	// not supporting non-comparable values for now
 	if e.Value != nil && t.Value != nil &&
-		!(reflect.TypeOf(e.Value).Comparable() && reflect.TypeOf(t.Value).Comparable()) {
+		(!reflect.TypeOf(e.Value).Comparable() || !reflect.TypeOf(t.Value).Comparable()) {
 		return false
 	}
 	return (e.Type == t.Type || t.Type == "") &&

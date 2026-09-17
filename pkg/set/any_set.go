@@ -13,15 +13,17 @@
 
 package set
 
-// AnySet is a set stores interface{}
+import "slices"
+
+// AnySet is a set stores any
 type AnySet struct {
-	eq    func(a interface{}, b interface{}) bool
-	slice []interface{}
+	eq    func(a any, b any) bool
+	slice []any
 }
 
 // NewAnySet builds a AnySet
-func NewAnySet(eq func(a interface{}, b interface{}) bool, aa ...interface{}) *AnySet {
-	slice := []interface{}{}
+func NewAnySet(eq func(a any, b any) bool, aa ...any) *AnySet {
+	slice := []any{}
 out:
 	for _, a := range aa {
 		for _, b := range slice {
@@ -35,7 +37,7 @@ out:
 }
 
 // Exist checks whether `val` exists in `s`.
-func (s *AnySet) Exist(val interface{}) bool {
+func (s *AnySet) Exist(val any) bool {
 	for _, a := range s.slice {
 		if s.eq(a, val) {
 			return true
@@ -45,7 +47,7 @@ func (s *AnySet) Exist(val interface{}) bool {
 }
 
 // Insert inserts `val` into `s`.
-func (s *AnySet) Insert(val interface{}) {
+func (s *AnySet) Insert(val any) {
 	if !s.Exist(val) {
 		s.slice = append(s.slice, val)
 	}
@@ -63,10 +65,10 @@ func (s *AnySet) Intersection(rhs *AnySet) *AnySet {
 }
 
 // Remove removes `val` from `s`
-func (s *AnySet) Remove(val interface{}) {
+func (s *AnySet) Remove(val any) {
 	for i, a := range s.slice {
 		if s.eq(a, val) {
-			s.slice = append(s.slice[:i], s.slice[i+1:]...)
+			s.slice = slices.Delete(s.slice, i, i+1)
 			return
 		}
 	}
@@ -85,6 +87,6 @@ func (s *AnySet) Difference(rhs *AnySet) *AnySet {
 }
 
 // Slice converts the set to a slice
-func (s *AnySet) Slice() []interface{} {
-	return append([]interface{}{}, s.slice...)
+func (s *AnySet) Slice() []any {
+	return slices.Clone(s.slice)
 }

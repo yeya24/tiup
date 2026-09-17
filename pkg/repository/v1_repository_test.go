@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -79,7 +80,7 @@ func TestPollutedManifest(t *testing.T) {
 	mirror = MockMirror{
 		Resources: map[string]string{
 			// these files will expire after 2120
-			"/timestamp.json": `{"signatures":[{"keyid":"66d4ea1da00076c822a6e1b4df5eb1e529eb38f6edcedff323e62f2bfe3eaddd","sig":"Mkrw+6H7hQATE0BpjOJ/f7GZlnDzADbxSqWS6+JxW6Dhw/17N+S/K127+7DnBhHNq7+uoiC7jPcCAxYXv2f096fowod9rqvYq47dMLMzNHZ/e63SNeI9B57m9wR58ljkH1cRY0dtJqMVESot0RMDRArYRRzs2kvPp8LvzfJqLP0IXPS/VWrOOyzSJoIuvaNyWY+dNrqM7XYI+y0TWIl06r00TwOjLKjjzLbJcqTBETharQ6o7O7U+V6H3QnmgRa0LtwKIpuDl52PSWhuKRhgfWB4sKfirVlTopGVDI7GmdrvCKlAY8x1tcXrlbDQAEKhHfJXTCO1MBaLToqHug3tMQ=="}],"signed":{"_type":"timestamp","expires":"2120-08-01T14:47:48+08:00","meta":{"/snapshot.json":{"hashes":{"sha256":"aba19fedb329be3c8a08291e06f9849997ca5a9c62f6b429865987c932488249"},"length":1760}},"spec_version":"0.1.0","version":639}}`,
+			"/timestamp.json": `{"signatures":[{"keyid":"66d4ea1da00076c822a6e1b4df5eb1e529eb38f6edcedff323e62f2bfe3eaddd","sig":"Mo/o68zmRCpu5gHB9uEyVVtf5Cz432F6dd/jkKVDQXw3vG4ftnOiIRF590OfE79VFQ3BXDgMUmfD7sdkcU5Gc4HBUqKWt3vI1tFsEFfxZDQSA/upONirknxtKKZtrjDkk/rjD7cLE3S/Stul+ho0LwwlFncUZmdYaaXBeP9YileekUR15S+XvIInNO5YK+vy2EqTjMQdYTMabhZHxvP35MUMnphXuBV0aLjuvkaksF2V0mXFGcB9GUHzmgGuW32VoF2G6UBiRYaSu0r1LjTqS2auL/TciLZmi95KAAlCz3f8SOpkQ0z5bZiSk8SFCbPN1tb97RSaFJQ1jnEmxZULZA=="}],"signed":{"_type":"timestamp","expires":"2120-08-01T14:47:48+08:00","meta":{"/snapshot.json":{"hashes":{"sha256":"acb8b69c0335c6b4f3b0315dc58bdf774fca558c050dd16ae4459e3a82d39261"},"length":1760}},"spec_version":"0.1.0","version":99999}}`,
 			"/420.index.json": `{"signatures":[{"keyid":"7fce7ec4f9c36d51dec7ec96065bb64958b743e46ea8141da668cd2ce58a9e61","sig":"MFVJxmU1ErcobtRcssvQiHQLTAVyCVieVpSNlgIAv6FSGN8utFpKuV3RKgelgJskt2j/gJ6k+ITpUqd1Y9iiff44N9u9oov0CBR7gYoSfSum8yEqI0AeJKePUu40959xe/1WU881npF50+LE8ovk0MC8mXzNDoe4kHWFZBve9s+VbPS1KwD2jdnf9sR95rJLF8vxMwnDwsXmdf5Y4TV9nUvQ996BRmr0YFQKBVl9DqxQ+Y2KyXjrNaZwJhKdF7I3W6fCOF4Cf5QMbZ6SG4TrPsscjscZQKJHox3iMuL6NGEem2B2lEJovrlBh0U9/cN4y6CZvEnL3uGYp7gxVvTe7A=="}],"signed":{"_type":"index","components":{"tidb":{"hidden":false,"owner":"pingcap","standalone":false,"url":"/tidb.json","yanked":false}},"default_components":[],"expires":"2121-06-23T12:05:15+08:00","owners":{"pingcap":{"keys":{"a61b695e2b86097d993e94e99fd15ec6d8fc8e9522948c9ff21c2f2c881093ae":{"keytype":"rsa","keyval":{"public":"-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnayxhw6KeoKK+Ax9RW6v\n66YjrpRpGLewLmSSAzJGX8nL5/a2nEbXbeF9po265KcBSFWol8jLBsmG56ruwwxp\noWWhJPncqGqy8wMeRMmTf7ATGa+tk+To7UAQD0MYzt7rRlIdpqi9Us3J6076Z83k\n2sxFnX9sVflhOsotGWL7hmrn/CJWxKsO6OVCoqbIlnJV8xFazE2eCfaDTIEEEgnh\nLIGDsmv1AN8ImUIn/hyKcm1PfhDZrF5qhEVhfz5D8aX3cUcEJw8BvCaNloXyHf+y\nDKjqO/dJ7YFWVt7nPqOvaEkBQGMd54ETJ/BbO9r3WTsjXKleoPovBSQ/oOxApypb\nNQIDAQAB\n-----END PUBLIC KEY-----\n"},"scheme":"rsassa-pss-sha256"}},"name":"PingCAP","threshold":1}},"spec_version":"0.1.0","version":420}}`,
 		},
 	}
@@ -193,10 +194,10 @@ func TestUpdateLocalSnapshot(t *testing.T) {
 	mirror.Resources[v1manifest.ManifestURLSnapshot] = serSnap
 	timestamp.Meta[v1manifest.ManifestURLSnapshot].Hashes[v1manifest.SHA256] = hash(serSnap)
 
-	signedTs := serialize(t, timestamp, privk)
-	mirror.Resources[v1manifest.ManifestURLTimestamp] = signedTs
+	signedTS := serialize(t, timestamp, privk)
+	mirror.Resources[v1manifest.ManifestURLTimestamp] = signedTS
 	ts := &v1manifest.Manifest{Signed: &v1manifest.Timestamp{}}
-	err := cjson.Unmarshal([]byte(signedTs), ts)
+	err := cjson.Unmarshal([]byte(signedTS), ts)
 	assert.Nil(t, err)
 	local.Manifests[v1manifest.ManifestFilenameTimestamp] = ts
 
@@ -458,13 +459,19 @@ func TestLatestStableVersion(t *testing.T) {
 	mirror.Resources[v1manifest.ManifestURLTimestamp] = serialize(t, ts, priv)
 	mirror.Resources["/7.foo.json"] = serialize(t, foo, indexPriv)
 
-	v, _, err := repo.LatestStableVersion("foo", false)
+	v, _, err := repo.LatestStableVersion("foo", false, nil)
 	assert.Nil(t, err)
 	assert.Equal(t, "v2.0.1", v.String())
 
-	v, _, err = repo.LatestStableVersion("foo", true)
+	v, _, err = repo.LatestStableVersion("foo", true, nil)
 	assert.Nil(t, err)
 	assert.Equal(t, "v2.0.3", v.String())
+
+	v, _, err = repo.LatestStableVersion("foo", true, func(s string) bool {
+		return s == "v2.0.3"
+	})
+	assert.Nil(t, err)
+	assert.Equal(t, "v2.0.1", v.String())
 }
 
 func TestLatestStableVersionWithPrerelease(t *testing.T) {
@@ -496,16 +503,20 @@ func TestLatestStableVersionWithPrerelease(t *testing.T) {
 	mirror.Resources[v1manifest.ManifestURLTimestamp] = serialize(t, ts, priv)
 	mirror.Resources["/7.foo.json"] = serialize(t, foo, indexPriv)
 
-	v, _, err := repo.LatestStableVersion("foo", false)
+	v, _, err := repo.LatestStableVersion("foo", false, nil)
 	assert.Nil(t, err)
 	assert.Equal(t, "v3.0.0-rc", v.String())
 }
 
 func TestUpdateComponents(t *testing.T) {
+	t1 := t.TempDir()
+	t2 := t.TempDir()
+
 	mirror := MockMirror{
 		Resources: map[string]string{},
 	}
 	local := v1manifest.NewMockManifests()
+	local.RootDir = t1
 	priv := setNewRoot(t, local)
 
 	repo := NewV1Repo(&mirror, Options{GOOS: "plat", GOARCH: "form"}, local)
@@ -533,7 +544,7 @@ func TestUpdateComponents(t *testing.T) {
 	assert.Equal(t, 1, len(local.Installed))
 	assert.Equal(t, "v2.0.1", local.Installed["foo"].Version)
 	assert.Equal(t, "foo201", local.Installed["foo"].Contents)
-	assert.Equal(t, "/tmp/mock/components/foo/v2.0.1/foo-2.0.1.tar.gz", local.Installed["foo"].BinaryPath)
+	assert.Equal(t, filepath.Join(t1, "components/foo/v2.0.1/foo-2.0.1.tar.gz"), local.Installed["foo"].BinaryPath)
 
 	// Update
 	foo.Version = 8
@@ -552,13 +563,13 @@ func TestUpdateComponents(t *testing.T) {
 	repo.PurgeTimestamp()
 	err = repo.UpdateComponents([]ComponentSpec{{
 		ID:        "foo",
-		TargetDir: "/tmp/mock-mock",
+		TargetDir: t2,
 	}})
 	assert.Nil(t, err)
 	assert.Equal(t, 1, len(local.Installed))
 	assert.Equal(t, "v2.0.2", local.Installed["foo"].Version)
 	assert.Equal(t, "foo202", local.Installed["foo"].Contents)
-	assert.Equal(t, "/tmp/mock-mock/foo-2.0.2.tar.gz", local.Installed["foo"].BinaryPath)
+	assert.Equal(t, filepath.Join(t2, "foo-2.0.2.tar.gz"), local.Installed["foo"].BinaryPath)
 
 	// Update; already up to date
 	err = repo.UpdateComponents([]ComponentSpec{{

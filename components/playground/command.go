@@ -45,18 +45,26 @@ type Command struct {
 	instance.Config
 }
 
-func buildCommands(tp CommandType, opt *bootOptions) (cmds []Command) {
+func buildCommands(tp CommandType, opt *BootOptions) (cmds []Command) {
 	commands := []struct {
 		comp string
 		instance.Config
 	}{
-		{"pd", opt.pd},
-		{"tikv", opt.tikv},
-		{"pump", opt.pump},
-		{"tiflash", opt.tiflash},
-		{"tidb", opt.tidb},
-		{"ticdc", opt.ticdc},
-		{"drainer", opt.drainer},
+		{"pd", opt.PD},
+		{"tso", opt.TSO},
+		{"scheduling", opt.Scheduling},
+		{"router", opt.Router},
+		{"resource-manager", opt.ResourceManager},
+		{"tikv", opt.TiKV},
+		{"pump", opt.Pump},
+		{"tiflash", opt.TiFlash},
+		{"tiproxy", opt.TiProxy},
+		{"tidb", opt.TiDB},
+		{"ticdc", opt.TiCDC},
+		{"tikv-cdc", opt.TiKVCDC},
+		{"drainer", opt.Drainer},
+		{"dm-master", opt.DMMaster},
+		{"dm-worker", opt.DMWorker},
 	}
 
 	for _, cmd := range commands {
@@ -74,7 +82,7 @@ func buildCommands(tp CommandType, opt *bootOptions) (cmds []Command) {
 }
 
 func newScaleOut() *cobra.Command {
-	var opt bootOptions
+	var opt BootOptions
 	cmd := &cobra.Command{
 		Use:     "scale-out instances",
 		Example: "tiup playground scale-out --db 1",
@@ -93,31 +101,58 @@ func newScaleOut() *cobra.Command {
 		Hidden: false,
 	}
 
-	cmd.Flags().IntVarP(&opt.tidb.Num, "db", "", opt.tidb.Num, "TiDB instance number")
-	cmd.Flags().IntVarP(&opt.tikv.Num, "kv", "", opt.tikv.Num, "TiKV instance number")
-	cmd.Flags().IntVarP(&opt.pd.Num, "pd", "", opt.pd.Num, "PD instance number")
-	cmd.Flags().IntVarP(&opt.tiflash.Num, "tiflash", "", opt.tiflash.Num, "TiFlash instance number")
-	cmd.Flags().IntVarP(&opt.ticdc.Num, "ticdc", "", opt.ticdc.Num, "TiCDC instance number")
-	cmd.Flags().IntVarP(&opt.pump.Num, "pump", "", opt.pump.Num, "Pump instance number")
-	cmd.Flags().IntVarP(&opt.drainer.Num, "drainer", "", opt.pump.Num, "Drainer instance number")
+	cmd.Flags().IntVarP(&opt.TiDB.Num, "db", "", opt.TiDB.Num, "TiDB instance number")
+	cmd.Flags().IntVarP(&opt.TiKV.Num, "kv", "", opt.TiKV.Num, "TiKV instance number")
+	cmd.Flags().IntVarP(&opt.PD.Num, "pd", "", opt.PD.Num, "PD instance number")
+	cmd.Flags().IntVarP(&opt.TSO.Num, "tso", "", opt.TSO.Num, "TSO instance number")
+	cmd.Flags().IntVarP(&opt.Scheduling.Num, "scheduling", "", opt.Scheduling.Num, "Scheduling instance number")
+	cmd.Flags().IntVarP(&opt.Router.Num, "router", "", opt.Router.Num, "Router instance number")
+	cmd.Flags().IntVarP(&opt.ResourceManager.Num, "resource-manager", "", opt.ResourceManager.Num, "Resource manager instance number")
+	cmd.Flags().IntVarP(&opt.TiFlash.Num, "tiflash", "", opt.TiFlash.Num, "TiFlash instance number")
+	cmd.Flags().IntVarP(&opt.TiProxy.Num, "tiproxy", "", opt.TiProxy.Num, "TiProxy instance number")
+	cmd.Flags().IntVarP(&opt.TiCDC.Num, "ticdc", "", opt.TiCDC.Num, "TiCDC instance number")
+	cmd.Flags().IntVarP(&opt.TiKVCDC.Num, "kvcdc", "", opt.TiKVCDC.Num, "TiKV-CDC instance number")
+	cmd.Flags().IntVarP(&opt.Pump.Num, "pump", "", opt.Pump.Num, "Pump instance number")
+	cmd.Flags().IntVarP(&opt.Drainer.Num, "drainer", "", opt.Pump.Num, "Drainer instance number")
+	cmd.Flags().StringVarP(&opt.TiDB.Host, "db.host", "", opt.TiDB.Host, "Playground TiDB host. If not provided, TiDB will still use `host` flag as its host")
+	cmd.Flags().StringVarP(&opt.PD.Host, "pd.host", "", opt.PD.Host, "Playground PD host. If not provided, PD will still use `host` flag as its host")
+	cmd.Flags().StringVarP(&opt.TSO.Host, "tso.host", "", opt.TSO.Host, "Playground TSO host. If not provided, TSO will still use `host` flag as its host")
+	cmd.Flags().StringVarP(&opt.Scheduling.Host, "scheduling.host", "", opt.Scheduling.Host, "Playground Scheduling host. If not provided, Scheduling will still use `host` flag as its host")
+	cmd.Flags().StringVarP(&opt.Router.Host, "router.host", "", opt.Router.Host, "Playground Router host. If not provided, Router will still use `host` flag as its host")
+	cmd.Flags().StringVarP(&opt.ResourceManager.Host, "resource-manager.host", "", opt.ResourceManager.Host, "Playground Resource manager host. If not provided, Resource manager will still use `host` flag as its host")
+	cmd.Flags().StringVarP(&opt.TiProxy.Host, "tiproxy.host", "", opt.PD.Host, "Playground TiProxy host. If not provided, TiProxy will still use `host` flag as its host")
+	cmd.Flags().IntVarP(&opt.DMMaster.Num, "dm-master", "", opt.DMMaster.Num, "DM-master instance number")
+	cmd.Flags().IntVarP(&opt.DMWorker.Num, "dm-worker", "", opt.DMWorker.Num, "DM-worker instance number")
 
-	cmd.Flags().StringVarP(&opt.tidb.Host, "db.host", "", opt.tidb.Host, "Playground TiDB host. If not provided, TiDB will still use `host` flag as its host")
-	cmd.Flags().StringVarP(&opt.pd.Host, "pd.host", "", opt.pd.Host, "Playground PD host. If not provided, PD will still use `host` flag as its host")
+	cmd.Flags().StringVarP(&opt.TiDB.ConfigPath, "db.config", "", opt.TiDB.ConfigPath, "TiDB instance configuration file")
+	cmd.Flags().StringVarP(&opt.TiKV.ConfigPath, "kv.config", "", opt.TiKV.ConfigPath, "TiKV instance configuration file")
+	cmd.Flags().StringVarP(&opt.PD.ConfigPath, "pd.config", "", opt.PD.ConfigPath, "PD instance configuration file")
+	cmd.Flags().StringVarP(&opt.TSO.ConfigPath, "tso.config", "", opt.TSO.ConfigPath, "TSO instance configuration file")
+	cmd.Flags().StringVarP(&opt.Scheduling.ConfigPath, "scheduling.config", "", opt.Scheduling.ConfigPath, "Scheduling instance configuration file")
+	cmd.Flags().StringVarP(&opt.Router.ConfigPath, "router.config", "", opt.Router.ConfigPath, "Router instance configuration file")
+	cmd.Flags().StringVarP(&opt.ResourceManager.ConfigPath, "resource-manager.config", "", opt.ResourceManager.ConfigPath, "Resource manager instance configuration file")
+	cmd.Flags().StringVarP(&opt.TiFlash.ConfigPath, "tiflash.config", "", opt.TiFlash.ConfigPath, "TiFlash instance configuration file")
+	cmd.Flags().StringVarP(&opt.TiProxy.ConfigPath, "tiproxy.config", "", opt.TiProxy.ConfigPath, "TiProxy instance configuration file")
+	cmd.Flags().StringVarP(&opt.Pump.ConfigPath, "pump.config", "", opt.Pump.ConfigPath, "Pump instance configuration file")
+	cmd.Flags().StringVarP(&opt.Drainer.ConfigPath, "drainer.config", "", opt.Drainer.ConfigPath, "Drainer instance configuration file")
+	cmd.Flags().StringVarP(&opt.DMMaster.ConfigPath, "dm-master.config", "", opt.DMMaster.ConfigPath, "DM-master instance configuration file")
+	cmd.Flags().StringVarP(&opt.DMWorker.ConfigPath, "dm-worker.config", "", opt.DMWorker.ConfigPath, "DM-worker instance configuration file")
 
-	cmd.Flags().StringVarP(&opt.tidb.ConfigPath, "db.config", "", opt.tidb.ConfigPath, "TiDB instance configuration file")
-	cmd.Flags().StringVarP(&opt.tikv.ConfigPath, "kv.config", "", opt.tikv.ConfigPath, "TiKV instance configuration file")
-	cmd.Flags().StringVarP(&opt.pd.ConfigPath, "pd.config", "", opt.pd.ConfigPath, "PD instance configuration file")
-	cmd.Flags().StringVarP(&opt.tidb.ConfigPath, "tiflash.config", "", opt.tidb.ConfigPath, "TiFlash instance configuration file")
-	cmd.Flags().StringVarP(&opt.pump.ConfigPath, "pump.config", "", opt.pump.ConfigPath, "Pump instance configuration file")
-	cmd.Flags().StringVarP(&opt.drainer.ConfigPath, "drainer.config", "", opt.drainer.ConfigPath, "Drainer instance configuration file")
-
-	cmd.Flags().StringVarP(&opt.tidb.BinPath, "db.binpath", "", opt.tidb.BinPath, "TiDB instance binary path")
-	cmd.Flags().StringVarP(&opt.tikv.BinPath, "kv.binpath", "", opt.tikv.BinPath, "TiKV instance binary path")
-	cmd.Flags().StringVarP(&opt.pd.BinPath, "pd.binpath", "", opt.pd.BinPath, "PD instance binary path")
-	cmd.Flags().StringVarP(&opt.tiflash.BinPath, "tiflash.binpath", "", opt.tiflash.BinPath, "TiFlash instance binary path")
-	cmd.Flags().StringVarP(&opt.ticdc.BinPath, "ticdc.binpath", "", opt.ticdc.BinPath, "TiCDC instance binary path")
-	cmd.Flags().StringVarP(&opt.pump.BinPath, "pump.binpath", "", opt.pump.BinPath, "Pump instance binary path")
-	cmd.Flags().StringVarP(&opt.drainer.BinPath, "drainer.binpath", "", opt.drainer.BinPath, "Drainer instance binary path")
+	cmd.Flags().StringVarP(&opt.TiDB.BinPath, "db.binpath", "", opt.TiDB.BinPath, "TiDB instance binary path")
+	cmd.Flags().StringVarP(&opt.TiKV.BinPath, "kv.binpath", "", opt.TiKV.BinPath, "TiKV instance binary path")
+	cmd.Flags().StringVarP(&opt.PD.BinPath, "pd.binpath", "", opt.PD.BinPath, "PD instance binary path")
+	cmd.Flags().StringVarP(&opt.TSO.BinPath, "tso.binpath", "", opt.TSO.BinPath, "TSO instance binary path")
+	cmd.Flags().StringVarP(&opt.Scheduling.BinPath, "scheduling.binpath", "", opt.Scheduling.BinPath, "Scheduling instance binary path")
+	cmd.Flags().StringVarP(&opt.Router.BinPath, "router.binpath", "", opt.Router.BinPath, "Router instance binary path")
+	cmd.Flags().StringVarP(&opt.ResourceManager.BinPath, "resource-manager.binpath", "", opt.ResourceManager.BinPath, "Resource manager instance binary path")
+	cmd.Flags().StringVarP(&opt.TiFlash.BinPath, "tiflash.binpath", "", opt.TiFlash.BinPath, "TiFlash instance binary path")
+	cmd.Flags().StringVarP(&opt.TiProxy.BinPath, "tiproxy.binpath", "", opt.TiProxy.BinPath, "TiProxy instance binary path")
+	cmd.Flags().StringVarP(&opt.TiCDC.BinPath, "ticdc.binpath", "", opt.TiCDC.BinPath, "TiCDC instance binary path")
+	cmd.Flags().StringVarP(&opt.TiKVCDC.BinPath, "kvcdc.binpath", "", opt.TiKVCDC.BinPath, "TiKVCDC instance binary path")
+	cmd.Flags().StringVarP(&opt.Pump.BinPath, "pump.binpath", "", opt.Pump.BinPath, "Pump instance binary path")
+	cmd.Flags().StringVarP(&opt.Drainer.BinPath, "drainer.binpath", "", opt.Drainer.BinPath, "Drainer instance binary path")
+	cmd.Flags().StringVarP(&opt.DMMaster.BinPath, "dm-master.binpath", "", opt.DMMaster.BinPath, "DM-master instance binary path")
+	cmd.Flags().StringVarP(&opt.DMWorker.BinPath, "dm-worker.binpath", "", opt.DMWorker.BinPath, "DM-worker instance binary path")
 
 	return cmd
 }
@@ -173,7 +208,7 @@ func scaleIn(pids []int) error {
 	return sendCommandsAndPrintResult(cmds, addr)
 }
 
-func scaleOut(args []string, opt *bootOptions) (num int, err error) {
+func scaleOut(args []string, opt *BootOptions) (num int, err error) {
 	port, err := targetTag()
 	if err != nil {
 		return 0, err

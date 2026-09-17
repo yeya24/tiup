@@ -14,26 +14,25 @@
 package command
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
-	"net/url"
+	"strings"
 	"time"
 
-	"github.com/fatih/color"
 	perrs "github.com/pingcap/errors"
-	"github.com/pingcap/tiup/pkg/cluster/api"
+	"github.com/pingcap/tiup/pkg/cluster/manager"
 	"github.com/pingcap/tiup/pkg/cluster/spec"
-	"github.com/pingcap/tiup/pkg/crypto"
 	"github.com/pingcap/tiup/pkg/meta"
 	"github.com/spf13/cobra"
 )
 
 func newDisplayCmd() *cobra.Command {
 	var (
-		clusterName       string
 		showDashboardOnly bool
 		showVersionOnly   bool
+		showTiKVLabels    bool
+		statusTimeout     uint64
+		dopt              manager.DisplayOption
 	)
 	cmd := &cobra.Command{
 		Use:   "display <cluster-name>",
@@ -43,19 +42,19 @@ func newDisplayCmd() *cobra.Command {
 				return cmd.Help()
 			}
 
-			clusterName = args[0]
-			teleCommand = append(teleCommand, scrubClusterName(clusterName))
+			gOpt.APITimeout = statusTimeout
+			dopt.ClusterName = args[0]
 
-			exist, err := tidbSpec.Exist(clusterName)
+			exist, err := tidbSpec.Exist(dopt.ClusterName)
 			if err != nil {
 				return err
 			}
 
 			if !exist {
-				return perrs.Errorf("Cluster %s not found", clusterName)
+				return perrs.Errorf("Cluster %s not found", dopt.ClusterName)
 			}
 
-			metadata, err := spec.ClusterMetadata(clusterName)
+			metadata, err := spec.ClusterMetadata(dopt.ClusterName)
 			if err != nil && !errors.Is(perrs.Cause(err), meta.ErrValidate) &&
 				!errors.Is(perrs.Cause(err), spec.ErrNoTiSparkMaster) {
 				return err
@@ -67,70 +66,49 @@ func newDisplayCmd() *cobra.Command {
 			}
 
 			if showDashboardOnly {
-				tlsCfg, err := metadata.Topology.TLSConfig(tidbSpec.Path(clusterName, spec.TLSCertKeyDir))
+				tlsCfg, err := metadata.Topology.TLSConfig(tidbSpec.Path(dopt.ClusterName, spec.TLSCertKeyDir))
 				if err != nil {
 					return err
 				}
-				return displayDashboardInfo(clusterName, tlsCfg)
+				return cm.DisplayDashboardInfo(dopt.ClusterName, time.Second*time.Duration(gOpt.APITimeout), tlsCfg)
 			}
-
-			return cm.Display(clusterName, gOpt)
+			if showTiKVLabels {
+				return cm.DisplayTiKVLabels(dopt, gOpt)
+			}
+			return cm.Display(dopt, gOpt)
+		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			switch len(args) {
+			case 0:
+				return shellCompGetClusterName(cm, toComplete)
+			default:
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
 		},
 	}
 
 	cmd.Flags().StringSliceVarP(&gOpt.Roles, "role", "R", nil, "Only display specified roles")
 	cmd.Flags().StringSliceVarP(&gOpt.Nodes, "node", "N", nil, "Only display specified nodes")
-	cmd.Flags().BoolVar(&gOpt.ShowUptime, "uptime", false, "Display with uptime")
+	cmd.Flags().BoolVar(&dopt.ShowUptime, "uptime", false, "Display with uptime")
 	cmd.Flags().BoolVar(&showDashboardOnly, "dashboard", false, "Only display TiDB Dashboard information")
 	cmd.Flags().BoolVar(&showVersionOnly, "version", false, "Only display TiDB cluster version")
+	cmd.Flags().BoolVar(&showTiKVLabels, "labels", false, "Only display labels of specified TiKV role or nodes")
+	cmd.Flags().BoolVar(&dopt.ShowProcess, "process", false, "display cpu and memory usage of nodes")
+	cmd.Flags().BoolVar(&dopt.ShowManageHost, "manage-host", false, "display manage host of nodes")
+	cmd.Flags().BoolVar(&dopt.ShowNuma, "numa", false, "display numa information of nodes")
+	cmd.Flags().BoolVar(&dopt.ShowVersions, "versions", false, "display component version of instances")
+	cmd.Flags().Uint64Var(&statusTimeout, "status-timeout", 10, "Timeout in seconds when getting node status")
 
 	return cmd
 }
 
-func displayDashboardInfo(clusterName string, tlsCfg *tls.Config) error {
-	metadata, err := spec.ClusterMetadata(clusterName)
-	if err != nil && !errors.Is(perrs.Cause(err), meta.ErrValidate) &&
-		!errors.Is(perrs.Cause(err), spec.ErrNoTiSparkMaster) {
-		return err
+func shellCompGetClusterName(cm *manager.Manager, toComplete string) ([]string, cobra.ShellCompDirective) {
+	var result []string
+	clusters, _ := cm.GetClusterList()
+	for _, c := range clusters {
+		if strings.HasPrefix(c.Name, toComplete) {
+			result = append(result, c.Name)
+		}
 	}
-
-	pdEndpoints := make([]string, 0)
-	for _, pd := range metadata.Topology.PDServers {
-		pdEndpoints = append(pdEndpoints, fmt.Sprintf("%s:%d", pd.Host, pd.ClientPort))
-	}
-
-	pdAPI := api.NewPDClient(pdEndpoints, 2*time.Second, tlsCfg)
-	dashboardAddr, err := pdAPI.GetDashboardAddress()
-	if err != nil {
-		return fmt.Errorf("failed to retrieve TiDB Dashboard instance from PD: %s", err)
-	}
-	if dashboardAddr == "auto" {
-		return fmt.Errorf("TiDB Dashboard is not initialized, please start PD and try again")
-	} else if dashboardAddr == "none" {
-		return fmt.Errorf("TiDB Dashboard is disabled")
-	}
-
-	u, err := url.Parse(dashboardAddr)
-	if err != nil {
-		return fmt.Errorf("unknown TiDB Dashboard PD instance: %s", dashboardAddr)
-	}
-
-	u.Path = "/dashboard/"
-
-	if tlsCfg != nil {
-		fmt.Println(
-			"Client certificate:",
-			color.CyanString(tidbSpec.Path(clusterName, spec.TLSCertKeyDir, spec.PFXClientCert)),
-		)
-		fmt.Println(
-			"Certificate password:",
-			color.CyanString(crypto.PKCS12Password),
-		)
-	}
-	fmt.Println(
-		"Dashboard URL:",
-		color.CyanString(u.String()),
-	)
-
-	return nil
+	return result, cobra.ShellCompDirectiveNoFileComp
 }

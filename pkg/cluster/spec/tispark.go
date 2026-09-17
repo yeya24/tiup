@@ -17,7 +17,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -31,24 +30,26 @@ import (
 	"github.com/pingcap/tiup/pkg/cluster/template/scripts"
 	system "github.com/pingcap/tiup/pkg/cluster/template/systemd"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/utils"
 	"go.uber.org/zap"
 )
 
 // TiSparkMasterSpec is the topology specification for TiSpark master node
 type TiSparkMasterSpec struct {
-	Host         string                 `yaml:"host"`
-	ListenHost   string                 `yaml:"listen_host,omitempty"`
-	SSHPort      int                    `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
-	Imported     bool                   `yaml:"imported,omitempty"`
-	Patched      bool                   `yaml:"patched,omitempty"`
-	Port         int                    `yaml:"port" default:"7077"`
-	WebPort      int                    `yaml:"web_port" default:"8080"`
-	DeployDir    string                 `yaml:"deploy_dir,omitempty"`
-	JavaHome     string                 `yaml:"java_home,omitempty" validate:"java_home:editable"`
-	SparkConfigs map[string]interface{} `yaml:"spark_config,omitempty" validate:"spark_config:ignore"`
-	SparkEnvs    map[string]string      `yaml:"spark_env,omitempty" validate:"spark_env:ignore"`
-	Arch         string                 `yaml:"arch,omitempty"`
-	OS           string                 `yaml:"os,omitempty"`
+	Host           string            `yaml:"host"`
+	ManageHost     string            `yaml:"manage_host,omitempty" validate:"manage_host:editable"`
+	ListenHost     string            `yaml:"listen_host,omitempty"`
+	SSHPort        int               `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
+	Patched        bool              `yaml:"patched,omitempty"`
+	IgnoreExporter bool              `yaml:"ignore_exporter,omitempty"`
+	Port           int               `yaml:"port" default:"7077"`
+	WebPort        int               `yaml:"web_port" default:"8080"`
+	DeployDir      string            `yaml:"deploy_dir,omitempty"`
+	JavaHome       string            `yaml:"java_home,omitempty" validate:"java_home:editable"`
+	SparkConfigs   map[string]any    `yaml:"spark_config,omitempty" validate:"spark_config:ignore"`
+	SparkEnvs      map[string]string `yaml:"spark_env,omitempty" validate:"spark_env:ignore"`
+	Arch           string            `yaml:"arch,omitempty"`
+	OS             string            `yaml:"os,omitempty"`
 }
 
 // Role returns the component role of the instance
@@ -58,7 +59,11 @@ func (s *TiSparkMasterSpec) Role() string {
 
 // SSH returns the host and SSH port of the instance
 func (s *TiSparkMasterSpec) SSH() (string, int) {
-	return s.Host, s.SSHPort
+	host := s.Host
+	if s.ManageHost != "" {
+		host = s.ManageHost
+	}
+	return host, s.SSHPort
 }
 
 // GetMainPort returns the main port of the instance
@@ -66,24 +71,26 @@ func (s *TiSparkMasterSpec) GetMainPort() int {
 	return s.Port
 }
 
-// IsImported returns if the node is imported from TiDB-Ansible
-func (s *TiSparkMasterSpec) IsImported() bool {
-	return s.Imported
+// IgnoreMonitorAgent returns if the node does not have monitor agents available
+func (s *TiSparkMasterSpec) IgnoreMonitorAgent() bool {
+	return s.IgnoreExporter
 }
 
 // TiSparkWorkerSpec is the topology specification for TiSpark slave nodes
 type TiSparkWorkerSpec struct {
-	Host       string `yaml:"host"`
-	ListenHost string `yaml:"listen_host,omitempty"`
-	SSHPort    int    `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
-	Imported   bool   `yaml:"imported,omitempty"`
-	Patched    bool   `yaml:"patched,omitempty"`
-	Port       int    `yaml:"port" default:"7078"`
-	WebPort    int    `yaml:"web_port" default:"8081"`
-	DeployDir  string `yaml:"deploy_dir,omitempty"`
-	JavaHome   string `yaml:"java_home,omitempty" validate:"java_home:editable"`
-	Arch       string `yaml:"arch,omitempty"`
-	OS         string `yaml:"os,omitempty"`
+	Host           string `yaml:"host"`
+	ManageHost     string `yaml:"manage_host,omitempty"`
+	ListenHost     string `yaml:"listen_host,omitempty"`
+	SSHPort        int    `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
+	Imported       bool   `yaml:"-"`
+	Patched        bool   `yaml:"patched,omitempty"`
+	IgnoreExporter bool   `yaml:"ignore_exporter,omitempty"`
+	Port           int    `yaml:"port" default:"7078"`
+	WebPort        int    `yaml:"web_port" default:"8081"`
+	DeployDir      string `yaml:"deploy_dir,omitempty"`
+	JavaHome       string `yaml:"java_home,omitempty" validate:"java_home:editable"`
+	Arch           string `yaml:"arch,omitempty"`
+	OS             string `yaml:"os,omitempty"`
 }
 
 // Role returns the component role of the instance
@@ -93,7 +100,11 @@ func (s *TiSparkWorkerSpec) Role() string {
 
 // SSH returns the host and SSH port of the instance
 func (s *TiSparkWorkerSpec) SSH() (string, int) {
-	return s.Host, s.SSHPort
+	host := s.Host
+	if s.ManageHost != "" {
+		host = s.ManageHost
+	}
+	return host, s.SSHPort
 }
 
 // GetMainPort returns the main port of the instance
@@ -101,9 +112,9 @@ func (s *TiSparkWorkerSpec) GetMainPort() int {
 	return s.Port
 }
 
-// IsImported returns if the node is imported from TiDB-Ansible
-func (s *TiSparkWorkerSpec) IsImported() bool {
-	return s.Imported
+// IgnoreMonitorAgent returns if the node does not have monitor agents available
+func (s *TiSparkWorkerSpec) IgnoreMonitorAgent() bool {
+	return s.IgnoreExporter
 }
 
 // TiSparkMasterComponent represents TiSpark master component.
@@ -119,6 +130,21 @@ func (c *TiSparkMasterComponent) Role() string {
 	return RoleTiSparkMaster
 }
 
+// Source implements Component interface.
+func (c *TiSparkMasterComponent) Source() string {
+	return ComponentTiSpark
+}
+
+// CalculateVersion implements the Component interface
+func (c *TiSparkMasterComponent) CalculateVersion(clusterVersion string) string {
+	return ""
+}
+
+// SetVersion implements Component interface.
+func (c *TiSparkMasterComponent) SetVersion(version string) {
+	// should never be calls
+}
+
 // Instances implements Component interface.
 func (c *TiSparkMasterComponent) Instances() []Instance {
 	ins := make([]Instance, 0, len(c.Topology.TiSparkMasters))
@@ -127,9 +153,12 @@ func (c *TiSparkMasterComponent) Instances() []Instance {
 			BaseInstance: BaseInstance{
 				InstanceSpec: s,
 				Name:         c.Name(),
+				ManageHost:   s.ManageHost,
 				Host:         s.Host,
 				Port:         s.Port,
 				SSHP:         s.SSHPort,
+				NumaNode:     "",
+				NumaCores:    "",
 
 				Ports: []int{
 					s.Port,
@@ -138,12 +167,13 @@ func (c *TiSparkMasterComponent) Instances() []Instance {
 				Dirs: []string{
 					s.DeployDir,
 				},
-				StatusFn: func(tlsCfg *tls.Config, _ ...string) string {
-					return statusByHost(s.Host, s.WebPort, "", tlsCfg)
+				StatusFn: func(_ context.Context, timeout time.Duration, tlsCfg *tls.Config, _ ...string) string {
+					return statusByHost(s.Host, s.WebPort, "", timeout, tlsCfg)
 				},
-				UptimeFn: func(tlsCfg *tls.Config) time.Duration {
+				UptimeFn: func(_ context.Context, timeout time.Duration, tlsCfg *tls.Config) time.Duration {
 					return 0
 				},
+				Component: c,
 			},
 			topo: c.Topology,
 		})
@@ -158,15 +188,15 @@ type TiSparkMasterInstance struct {
 }
 
 // GetCustomFields get custom spark configs of the instance
-func (i *TiSparkMasterInstance) GetCustomFields() map[string]interface{} {
+func (i *TiSparkMasterInstance) GetCustomFields() map[string]any {
 	v := reflect.Indirect(reflect.ValueOf(i.InstanceSpec)).FieldByName("SparkConfigs")
 	if !v.IsValid() {
 		return nil
 	}
-	return v.Interface().(map[string]interface{})
+	return v.Interface().(map[string]any)
 }
 
-// GetCustomEnvs get custom spark envionment variables of the instance
+// GetCustomEnvs get custom spark environment variables of the instance
 func (i *TiSparkMasterInstance) GetCustomEnvs() map[string]string {
 	v := reflect.Indirect(reflect.ValueOf(i.InstanceSpec)).FieldByName("SparkEnvs")
 	if !v.IsValid() {
@@ -197,7 +227,7 @@ func (i *TiSparkMasterInstance) InitConfig(
 	sysCfg := filepath.Join(paths.Cache, fmt.Sprintf("%s-%s-%d.service", comp, host, port))
 
 	// insert checkpoint
-	point := checkpoint.Acquire(ctx, CopyConfigFile, map[string]interface{}{"config-file": sysCfg})
+	point := checkpoint.Acquire(ctx, CopyConfigFile, map[string]any{"config-file": sysCfg})
 	defer func() {
 		point.Release(err, zap.String("config-file", sysCfg))
 	}()
@@ -211,22 +241,34 @@ func (i *TiSparkMasterInstance) InitConfig(
 		return errors.Trace(err)
 	}
 	tgt := filepath.Join("/tmp", comp+"_"+uuid.New().String()+".service")
-	if err := e.Transfer(ctx, sysCfg, tgt, false); err != nil {
+	if err := e.Transfer(ctx, sysCfg, tgt, false, 0, false); err != nil {
 		return errors.Annotatef(err, "transfer from %s to %s failed", sysCfg, tgt)
 	}
-	cmd := fmt.Sprintf("mv %s /etc/systemd/system/%s-%d.service", tgt, comp, port)
-	if _, _, err := e.Execute(ctx, cmd, true); err != nil {
+	systemdDir := "/etc/systemd/system/"
+	sudo := true
+	if i.topo.BaseTopo().GlobalOptions.SystemdMode == UserMode {
+		systemdDir = "~/.config/systemd/user/"
+		sudo = false
+	}
+	cmd := fmt.Sprintf("mv %s %s%s-%d.service", tgt, systemdDir, comp, port)
+	if _, _, err := e.Execute(ctx, cmd, sudo); err != nil {
 		return errors.Annotatef(err, "execute: %s", cmd)
 	}
 
+	// restorecon restores SELinux Contexts
+	// Check with: ls -lZ /path/to/file
+	// If the context is wrong systemctl will complain about a missing unit file
+	// Note that we won't check for errors here because:
+	// - We don't support SELinux in Enforcing mode
+	// - restorecon might not be available (Ubuntu doesn't install SELinux tools by default)
+	cmd = fmt.Sprintf("restorecon %s%s-%d.service", systemdDir, comp, port)
+	e.Execute(ctx, cmd, sudo) //nolint
+
 	// transfer default config
-	pdList := make([]string, 0)
-	for _, pd := range topo.Endpoints(deployUser) {
-		pdList = append(pdList, fmt.Sprintf("%s:%d", pd.IP, pd.ClientPort))
-	}
+	pdList := topo.GetPDList()
 	masterList := make([]string, 0)
 	for _, master := range topo.TiSparkMasters {
-		masterList = append(masterList, fmt.Sprintf("%s:%d", master.Host, master.Port))
+		masterList = append(masterList, utils.JoinHostPort(master.Host, master.Port))
 	}
 
 	cfg := config.NewTiSparkConfig(pdList).WithMasters(strings.Join(masterList, ",")).
@@ -237,7 +279,7 @@ func (i *TiSparkMasterInstance) InitConfig(
 		return err
 	}
 	dst := filepath.Join(paths.Deploy, "conf", "spark-defaults.conf")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 
@@ -253,7 +295,7 @@ func (i *TiSparkMasterInstance) InitConfig(
 	}
 	// tispark files are all in a "spark" sub-directory of deploy dir
 	dst = filepath.Join(paths.Deploy, "conf", "spark-env.sh")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 
@@ -263,11 +305,11 @@ func (i *TiSparkMasterInstance) InitConfig(
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(fp, log4jFile, 0644); err != nil {
+	if err := utils.WriteFile(fp, log4jFile, 0644); err != nil {
 		return err
 	}
 	dst = filepath.Join(paths.Deploy, "conf", "log4j.properties")
-	return e.Transfer(ctx, fp, dst, false)
+	return e.Transfer(ctx, fp, dst, false, 0, false)
 }
 
 // ScaleConfig deploy temporary config on scaling
@@ -300,6 +342,21 @@ func (c *TiSparkWorkerComponent) Role() string {
 	return RoleTiSparkWorker
 }
 
+// Source implements Component interface.
+func (c *TiSparkWorkerComponent) Source() string {
+	return ComponentTiSpark
+}
+
+// CalculateVersion implements the Component interface
+func (c *TiSparkWorkerComponent) CalculateVersion(clusterVersion string) string {
+	return ""
+}
+
+// SetVersion implements Component interface.
+func (c *TiSparkWorkerComponent) SetVersion(version string) {
+	// should never be called
+}
+
 // Instances implements Component interface.
 func (c *TiSparkWorkerComponent) Instances() []Instance {
 	ins := make([]Instance, 0, len(c.Topology.TiSparkWorkers))
@@ -308,9 +365,12 @@ func (c *TiSparkWorkerComponent) Instances() []Instance {
 			BaseInstance: BaseInstance{
 				InstanceSpec: s,
 				Name:         c.Name(),
+				ManageHost:   s.ManageHost,
 				Host:         s.Host,
 				Port:         s.Port,
 				SSHP:         s.SSHPort,
+				NumaNode:     "",
+				NumaCores:    "",
 
 				Ports: []int{
 					s.Port,
@@ -319,12 +379,13 @@ func (c *TiSparkWorkerComponent) Instances() []Instance {
 				Dirs: []string{
 					s.DeployDir,
 				},
-				StatusFn: func(tlsCfg *tls.Config, _ ...string) string {
-					return statusByHost(s.Host, s.WebPort, "", tlsCfg)
+				StatusFn: func(_ context.Context, timeout time.Duration, tlsCfg *tls.Config, _ ...string) string {
+					return statusByHost(s.Host, s.WebPort, "", timeout, tlsCfg)
 				},
-				UptimeFn: func(tlsCfg *tls.Config) time.Duration {
+				UptimeFn: func(_ context.Context, timeout time.Duration, tlsCfg *tls.Config) time.Duration {
 					return 0
 				},
+				Component: c,
 			},
 			topo: c.Topology,
 		})
@@ -360,7 +421,7 @@ func (i *TiSparkWorkerInstance) InitConfig(
 	sysCfg := filepath.Join(paths.Cache, fmt.Sprintf("%s-%s-%d.service", comp, host, port))
 
 	// insert checkpoint
-	point := checkpoint.Acquire(ctx, CopyConfigFile, map[string]interface{}{"config-file": sysCfg})
+	point := checkpoint.Acquire(ctx, CopyConfigFile, map[string]any{"config-file": sysCfg})
 	defer func() {
 		point.Release(err, zap.String("config-file", sysCfg))
 	}()
@@ -374,33 +435,42 @@ func (i *TiSparkWorkerInstance) InitConfig(
 		return errors.Trace(err)
 	}
 	tgt := filepath.Join("/tmp", comp+"_"+uuid.New().String()+".service")
-	if err := e.Transfer(ctx, sysCfg, tgt, false); err != nil {
+	if err := e.Transfer(ctx, sysCfg, tgt, false, 0, false); err != nil {
 		return errors.Annotatef(err, "transfer from %s to %s failed", sysCfg, tgt)
 	}
-	cmd := fmt.Sprintf("mv %s /etc/systemd/system/%s-%d.service", tgt, comp, port)
-	if _, _, err := e.Execute(ctx, cmd, true); err != nil {
+	systemdDir := "/etc/systemd/system/"
+	sudo := true
+	if i.topo.BaseTopo().GlobalOptions.SystemdMode == UserMode {
+		systemdDir = "~/.config/systemd/user/"
+		sudo = false
+	}
+	cmd := fmt.Sprintf("mv %s %s%s-%d.service", tgt, systemdDir, comp, port)
+	if _, _, err := e.Execute(ctx, cmd, sudo); err != nil {
 		return errors.Annotatef(err, "execute: %s", cmd)
 	}
 
 	// transfer default config
-	pdList := make([]string, 0)
-	for _, pd := range topo.Endpoints(deployUser) {
-		pdList = append(pdList, fmt.Sprintf("%s:%d", pd.IP, pd.ClientPort))
-	}
+	pdList := topo.GetPDList()
 	masterList := make([]string, 0)
 	for _, master := range topo.TiSparkMasters {
-		masterList = append(masterList, fmt.Sprintf("%s:%d", master.Host, master.Port))
+		masterList = append(masterList, utils.JoinHostPort(master.Host, master.Port))
 	}
 
 	cfg := config.NewTiSparkConfig(pdList).WithMasters(strings.Join(masterList, ",")).
 		WithCustomFields(topo.TiSparkMasters[0].SparkConfigs)
+
+	// doesn't work
+	if _, err := i.setTLSConfig(ctx, false, nil, paths); err != nil {
+		return err
+	}
+
 	// transfer spark-defaults.conf
 	fp := filepath.Join(paths.Cache, fmt.Sprintf("spark-defaults-%s-%d.conf", host, port))
 	if err := cfg.ConfigToFile(fp); err != nil {
 		return err
 	}
 	dst := filepath.Join(paths.Deploy, "conf", "spark-defaults.conf")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 
@@ -417,7 +487,7 @@ func (i *TiSparkWorkerInstance) InitConfig(
 	}
 	// tispark files are all in a "spark" sub-directory of deploy dir
 	dst = filepath.Join(paths.Deploy, "conf", "spark-env.sh")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 
@@ -427,11 +497,11 @@ func (i *TiSparkWorkerInstance) InitConfig(
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(fp, slaveSh, 0755); err != nil {
+	if err := utils.WriteFile(fp, slaveSh, 0755); err != nil {
 		return err
 	}
 	dst = filepath.Join(paths.Deploy, "sbin", "start-slave.sh")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 
@@ -441,11 +511,17 @@ func (i *TiSparkWorkerInstance) InitConfig(
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(fp, log4jFile, 0644); err != nil {
+	if err := utils.WriteFile(fp, log4jFile, 0644); err != nil {
 		return err
 	}
 	dst = filepath.Join(paths.Deploy, "conf", "log4j.properties")
-	return e.Transfer(ctx, fp, dst, false)
+	return e.Transfer(ctx, fp, dst, false, 0, false)
+}
+
+// setTLSConfig set TLS Config to support enable/disable TLS
+// TiSparkWorkerInstance no need to configure TLS
+func (i *TiSparkWorkerInstance) setTLSConfig(ctx context.Context, enableTLS bool, configs map[string]any, paths meta.DirPaths) (map[string]any, error) {
+	return nil, nil
 }
 
 // ScaleConfig deploy temporary config on scaling

@@ -14,50 +14,76 @@
 package spec
 
 import (
-	"github.com/pingcap/check"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
-type utilSuite struct{}
-
-var _ = check.Suite(&utilSuite{})
-
-func (s utilSuite) TestAbs(c *check.C) {
+func TestAbs(t *testing.T) {
 	var path string
 	path = Abs(" foo", "")
-	c.Assert(path, check.Equals, "/home/foo")
+	require.Equal(t, "/home/foo", path)
 	path = Abs("foo ", " ")
-	c.Assert(path, check.Equals, "/home/foo")
+	require.Equal(t, "/home/foo", path)
 	path = Abs("foo", "bar")
-	c.Assert(path, check.Equals, "/home/foo/bar")
+	require.Equal(t, "/home/foo/bar", path)
 	path = Abs("foo", " bar")
-	c.Assert(path, check.Equals, "/home/foo/bar")
+	require.Equal(t, "/home/foo/bar", path)
 	path = Abs("foo", "bar ")
-	c.Assert(path, check.Equals, "/home/foo/bar")
+	require.Equal(t, "/home/foo/bar", path)
 	path = Abs("foo", " bar ")
-	c.Assert(path, check.Equals, "/home/foo/bar")
+	require.Equal(t, "/home/foo/bar", path)
 	path = Abs("foo", "/bar")
-	c.Assert(path, check.Equals, "/bar")
+	require.Equal(t, "/bar", path)
 	path = Abs("foo", " /bar")
-	c.Assert(path, check.Equals, "/bar")
+	require.Equal(t, "/bar", path)
 	path = Abs("foo", "/bar ")
-	c.Assert(path, check.Equals, "/bar")
+	require.Equal(t, "/bar", path)
 	path = Abs("foo", " /bar ")
-	c.Assert(path, check.Equals, "/bar")
+	require.Equal(t, "/bar", path)
 }
 
-func (s *utilSuite) TestMultiDirAbs(c *check.C) {
+func TestMultiDirAbs(t *testing.T) {
 	paths := MultiDirAbs("tidb", "")
-	c.Assert(len(paths), check.Equals, 0)
+	require.Equal(t, 0, len(paths))
 
 	paths = MultiDirAbs("tidb", " ")
-	c.Assert(len(paths), check.Equals, 0)
+	require.Equal(t, 0, len(paths))
 
 	paths = MultiDirAbs("tidb", "a ")
-	c.Assert(len(paths), check.Equals, 1)
-	c.Assert(paths[0], check.Equals, "/home/tidb/a")
+	require.Equal(t, 1, len(paths))
+	require.Equal(t, "/home/tidb/a", paths[0])
 
 	paths = MultiDirAbs("tidb", "a , /tmp/b")
-	c.Assert(len(paths), check.Equals, 2)
-	c.Assert(paths[0], check.Equals, "/home/tidb/a")
-	c.Assert(paths[1], check.Equals, "/tmp/b")
+	require.Equal(t, 2, len(paths))
+	require.Equal(t, "/home/tidb/a", paths[0])
+	require.Equal(t, "/tmp/b", paths[1])
+}
+
+func TestUptimeByHost(t *testing.T) {
+	now := float64(time.Now().Add(-5 * time.Minute).Unix())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/metrics", r.URL.Path)
+		fmt.Fprintf(w, "# HELP process_start_time_seconds mock data\n")
+		fmt.Fprintf(w, "# TYPE process_start_time_seconds gauge\n")
+		fmt.Fprintf(w, "process_start_time_seconds %.9e\n", now)
+	}))
+	t.Cleanup(func() {
+		server.Close()
+	})
+
+	u, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	port, err := strconv.Atoi(u.Port())
+	require.NoError(t, err)
+
+	got := UptimeByHost(u.Hostname(), port, 5*time.Second, nil, "")
+	require.GreaterOrEqual(t, got, 5*time.Minute)
 }

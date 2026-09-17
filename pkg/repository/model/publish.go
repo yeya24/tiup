@@ -15,11 +15,11 @@ package model
 
 import "io"
 
-// ComponentData is used to represent the tarbal
+// ComponentData is used to represent the tarball
 type ComponentData interface {
 	io.Reader
 
-	// Filename is the name of tarbal
+	// Filename is the name of tarball
 	Filename() string
 }
 
@@ -30,6 +30,7 @@ type ComponentInfo interface {
 	Standalone() *bool
 	Yanked() *bool
 	Hidden() *bool
+	OwnerID() string
 }
 
 // PublishInfo implements ComponentInfo
@@ -38,6 +39,7 @@ type PublishInfo struct {
 	Stand *bool
 	Yank  *bool
 	Hide  *bool
+	Owner string
 }
 
 // TarInfo implements ComponentData
@@ -72,4 +74,9 @@ func (i *PublishInfo) Yanked() *bool {
 // Hidden implements ComponentInfo
 func (i *PublishInfo) Hidden() *bool {
 	return i.Hide
+}
+
+// OwnerID implements ComponentInfo
+func (i *PublishInfo) OwnerID() string {
+	return i.Owner
 }

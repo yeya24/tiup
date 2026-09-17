@@ -14,38 +14,53 @@
 package spec
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"maps"
+	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
 
+	"text/template"
+
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tiup/embed"
 	"github.com/pingcap/tiup/pkg/cluster/ctxt"
 	"github.com/pingcap/tiup/pkg/cluster/template/config"
 	"github.com/pingcap/tiup/pkg/cluster/template/scripts"
 	"github.com/pingcap/tiup/pkg/meta"
+	"github.com/pingcap/tiup/pkg/utils"
+	"gopkg.in/ini.v1"
 )
 
 // GrafanaSpec represents the Grafana topology specification in topology.yaml
 type GrafanaSpec struct {
-	Host            string               `yaml:"host"`
-	SSHPort         int                  `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
-	Imported        bool                 `yaml:"imported,omitempty"`
-	Patched         bool                 `yaml:"patched,omitempty"`
-	Port            int                  `yaml:"port" default:"3000"`
-	DeployDir       string               `yaml:"deploy_dir,omitempty"`
-	ResourceControl meta.ResourceControl `yaml:"resource_control,omitempty" validate:"resource_control:editable"`
-	Arch            string               `yaml:"arch,omitempty"`
-	OS              string               `yaml:"os,omitempty"`
-	DashboardDir    string               `yaml:"dashboard_dir,omitempty" validate:"dashboard_dir:editable"`
-	Username        string               `yaml:"username,omitempty" default:"admin" validate:"username:editable"`
-	Password        string               `yaml:"password,omitempty" default:"admin" validate:"password:editable"`
-	AnonymousEnable bool                 `yaml:"anonymous_enable" default:"false" validate:"anonymous_enable:editable"`
-	RootURL         string               `yaml:"root_url" validate:"root_url:editable"`
-	Domain          string               `yaml:"domain" validate:"domain:editable"`
+	Host              string               `yaml:"host"`
+	ManageHost        string               `yaml:"manage_host,omitempty" validate:"manage_host:editable"`
+	SSHPort           int                  `yaml:"ssh_port,omitempty" validate:"ssh_port:editable"`
+	Patched           bool                 `yaml:"patched,omitempty"`
+	IgnoreExporter    bool                 `yaml:"ignore_exporter,omitempty"`
+	Port              int                  `yaml:"port" default:"3000"`
+	DeployDir         string               `yaml:"deploy_dir,omitempty"`
+	Config            map[string]string    `yaml:"config,omitempty" validate:"config:ignore"`
+	ResourceControl   meta.ResourceControl `yaml:"resource_control,omitempty" validate:"resource_control:editable"`
+	Arch              string               `yaml:"arch,omitempty"`
+	OS                string               `yaml:"os,omitempty"`
+	DashboardDir      string               `yaml:"dashboard_dir,omitempty" validate:"dashboard_dir:editable"`
+	Username          string               `yaml:"username,omitempty" default:"admin" validate:"username:editable"`
+	Password          string               `yaml:"password,omitempty" default:"admin" validate:"password:editable"`
+	AnonymousEnable   bool                 `yaml:"anonymous_enable" default:"false" validate:"anonymous_enable:editable"`
+	RootURL           string               `yaml:"root_url" validate:"root_url:editable"`
+	Domain            string               `yaml:"domain" validate:"domain:editable"`
+	DefaultTheme      string               `yaml:"default_theme,omitempty" validate:"default_theme:editable"`
+	OrgName           string               `yaml:"org_name,omitempty" validate:"org_name:editable"`
+	OrgRole           string               `yaml:"org_role,omitempty" validate:"org_role:editable"`
+	UseVMAsDatasource bool                 `yaml:"use_vm_as_datasource,omitempty" validate:"use_vm_as_datasource:editable"`
 }
 
 // Role returns the component role of the instance
@@ -55,7 +70,11 @@ func (s *GrafanaSpec) Role() string {
 
 // SSH returns the host and SSH port of the instance
 func (s *GrafanaSpec) SSH() (string, int) {
-	return s.Host, s.SSHPort
+	host := s.Host
+	if s.ManageHost != "" {
+		host = s.ManageHost
+	}
+	return host, s.SSHPort
 }
 
 // GetMainPort returns the main port of the instance
@@ -63,9 +82,17 @@ func (s *GrafanaSpec) GetMainPort() int {
 	return s.Port
 }
 
-// IsImported returns if the node is imported from TiDB-Ansible
-func (s *GrafanaSpec) IsImported() bool {
-	return s.Imported
+// GetManageHost returns the manage host of the instance
+func (s *GrafanaSpec) GetManageHost() string {
+	if s.ManageHost != "" {
+		return s.ManageHost
+	}
+	return s.Host
+}
+
+// IgnoreMonitorAgent returns if the node does not have monitor agents available
+func (s *GrafanaSpec) IgnoreMonitorAgent() bool {
+	return s.IgnoreExporter
 }
 
 // GrafanaComponent represents Grafana component.
@@ -81,6 +108,26 @@ func (c *GrafanaComponent) Role() string {
 	return RoleMonitor
 }
 
+// Source implements Component interface.
+func (c *GrafanaComponent) Source() string {
+	return ComponentGrafana
+}
+
+// CalculateVersion implements the Component interface
+func (c *GrafanaComponent) CalculateVersion(clusterVersion string) string {
+	// always not follow cluster version, use ""(latest) by default
+	version := c.Topology.BaseTopo().GrafanaVersion
+	if version != nil && *version != "" {
+		return *version
+	}
+	return clusterVersion
+}
+
+// SetVersion implements Component interface.
+func (c *GrafanaComponent) SetVersion(version string) {
+	*c.BaseTopo().GrafanaVersion = version
+}
+
 // Instances implements Component interface.
 func (c *GrafanaComponent) Instances() []Instance {
 	servers := c.BaseTopo().Grafanas
@@ -92,8 +139,12 @@ func (c *GrafanaComponent) Instances() []Instance {
 				InstanceSpec: s,
 				Name:         c.Name(),
 				Host:         s.Host,
+				ManageHost:   s.ManageHost,
+				ListenHost:   c.BaseTopo().GlobalOptions.ListenHost,
 				Port:         s.Port,
 				SSHP:         s.SSHPort,
+				NumaNode:     "",
+				NumaCores:    "",
 
 				Ports: []int{
 					s.Port,
@@ -101,12 +152,13 @@ func (c *GrafanaComponent) Instances() []Instance {
 				Dirs: []string{
 					s.DeployDir,
 				},
-				StatusFn: func(_ *tls.Config, _ ...string) string {
-					return statusByHost(s.Host, s.Port, "", nil)
+				StatusFn: func(_ context.Context, timeout time.Duration, _ *tls.Config, _ ...string) string {
+					return statusByHost(s.GetManageHost(), s.Port, "/login", timeout, nil)
 				},
-				UptimeFn: func(tlsCfg *tls.Config) time.Duration {
-					return UptimeByHost(s.Host, s.Port, tlsCfg)
+				UptimeFn: func(_ context.Context, timeout time.Duration, tlsCfg *tls.Config) time.Duration {
+					return UptimeByHost(s.GetManageHost(), s.Port, timeout, tlsCfg, "")
 				},
+				Component: c,
 			},
 			topo: c.Topology,
 		})
@@ -135,14 +187,15 @@ func (i *GrafanaInstance) InitConfig(
 	}
 
 	// transfer run script
-	cfg := scripts.NewGrafanaScript(clusterName, paths.Deploy)
+	cfg := &scripts.GrafanaScript{DeployDir: paths.Deploy}
+
 	fp := filepath.Join(paths.Cache, fmt.Sprintf("run_grafana_%s_%d.sh", i.GetHost(), i.GetPort()))
 	if err := cfg.ConfigToFile(fp); err != nil {
 		return err
 	}
 
 	dst := filepath.Join(paths.Deploy, "scripts", "run_grafana.sh")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
 		return err
 	}
 
@@ -152,7 +205,7 @@ func (i *GrafanaInstance) InitConfig(
 
 	// transfer config
 	spec := i.InstanceSpec.(*GrafanaSpec)
-	fp = filepath.Join(paths.Cache, fmt.Sprintf("grafana_%s.ini", i.GetHost()))
+	fp = filepath.Join(paths.Cache, fmt.Sprintf("grafana_%s_%d.ini", i.GetHost(), i.GetPort()))
 	if err := config.NewGrafanaConfig(i.GetHost(), paths.Deploy).
 		WithPort(uint64(i.GetPort())).
 		WithUsername(spec.Username).
@@ -160,14 +213,32 @@ func (i *GrafanaInstance) InitConfig(
 		WithAnonymousenable(spec.AnonymousEnable).
 		WithRootURL(spec.RootURL).
 		WithDomain(spec.Domain).
+		WithDefaultTheme(spec.DefaultTheme).
+		WithOrgName(spec.OrgName).
+		WithOrgRole(spec.OrgRole).
 		ConfigToFile(fp); err != nil {
 		return err
 	}
-	dst = filepath.Join(paths.Deploy, "conf", "grafana.ini")
-	if err := e.Transfer(ctx, fp, dst, false); err != nil {
+
+	// doesn't work
+	if _, err := i.setTLSConfig(ctx, false, nil, paths); err != nil {
 		return err
 	}
 
+	userConfig := i.topo.GetGrafanaConfig()
+	if userConfig == nil {
+		userConfig = make(map[string]string)
+	}
+	maps.Copy(userConfig, spec.Config)
+	err := mergeAdditionalGrafanaConf(fp, userConfig)
+	if err != nil {
+		return err
+	}
+
+	dst = filepath.Join(paths.Deploy, "conf", "grafana.ini")
+	if err := e.Transfer(ctx, fp, dst, false, 0, false); err != nil {
+		return err
+	}
 	if err := i.installDashboards(ctx, e, paths.Deploy, clusterName, clusterVersion); err != nil {
 		return errors.Annotate(err, "install dashboards")
 	}
@@ -187,8 +258,12 @@ func (i *GrafanaInstance) InitConfig(
 		return err
 	}
 
+	// Get the grafana spec
+	spec = i.InstanceSpec.(*GrafanaSpec)
+
+	// Get monitors
 	topo := reflect.ValueOf(i.topo)
-	if topo.Kind() == reflect.Ptr {
+	if topo.Kind() == reflect.Pointer {
 		topo = topo.Elem()
 	}
 	val := topo.FieldByName("Monitors")
@@ -200,14 +275,67 @@ func (i *GrafanaInstance) InitConfig(
 	if len(monitors) == 0 {
 		return errors.New("no prometheus found in topology")
 	}
+
+	// Create datasources configuration
+	datasources := make([]*config.DatasourceConfig, 0)
+
+	// Determine which datasource is default based on Grafana spec
+	vmIsDefault := spec.UseVMAsDatasource && monitors[0].PromRemoteWriteToVM
+	promIsDefault := !vmIsDefault
+
+	// Add Prometheus datasource
+	promDatasource := config.NewDatasourceConfig(
+		clusterName,
+		// not support tls
+		fmt.Sprintf("http://%s", utils.JoinHostPort(monitors[0].Host, monitors[0].Port)),
+	).WithIsDefault(promIsDefault)
+	datasources = append(datasources, promDatasource)
+
+	// Add VM datasource if enabled
+	if monitors[0].PromRemoteWriteToVM && monitors[0].NgPort > 0 {
+		vmDatasource := config.NewDatasourceConfig(
+			fmt.Sprintf("%s-vm", clusterName),
+			// not support tls
+			fmt.Sprintf("http://%s", utils.JoinHostPort(monitors[0].Host, monitors[0].NgPort)),
+		).WithIsDefault(vmIsDefault)
+		datasources = append(datasources, vmDatasource)
+	}
+
+	// Write datasources configuration
 	fp = filepath.Join(paths.Cache, fmt.Sprintf("datasource_%s.yml", i.GetHost()))
-	if err := config.NewDatasourceConfig(clusterName, monitors[0].Host).
-		WithPort(uint64(monitors[0].Port)).
-		ConfigToFile(fp); err != nil {
+	content := bytes.NewBuffer(nil)
+
+	// Create a map to hold all datasources
+	datasourceMap := map[string]any{
+		"Datasources": datasources,
+	}
+
+	// Create a template for the datasource configuration
+	tpl, err := embed.ReadTemplate(path.Join("templates", "config", "datasource.yml.tpl"))
+	if err != nil {
 		return err
 	}
+
+	tmpl, err := template.New("Datasource").Parse(string(tpl))
+	if err != nil {
+		return err
+	}
+
+	if err := tmpl.Execute(content, datasourceMap); err != nil {
+		return err
+	}
+
+	if err := utils.WriteFile(fp, content.Bytes(), 0644); err != nil {
+		return err
+	}
+
 	dst = filepath.Join(paths.Deploy, "provisioning", "datasources", "datasource.yml")
 	return i.TransferLocalConfigFile(ctx, e, fp, dst)
+}
+
+// setTLSConfig set TLS Config to support enable/disable TLS
+func (i *GrafanaInstance) setTLSConfig(ctx context.Context, enableTLS bool, configs map[string]any, paths meta.DirPaths) (map[string]any, error) {
+	return nil, nil
 }
 
 func (i *GrafanaInstance) initDashboards(ctx context.Context, e ctxt.Executor, spec *GrafanaSpec, paths meta.DirPaths, clusterName string) error {
@@ -228,16 +356,36 @@ func (i *GrafanaInstance) initDashboards(ctx context.Context, e ctxt.Executor, s
 		return errors.Annotatef(err, "stderr: %s", string(stderr))
 	}
 
-	// Deal with the cluster name
+	// Get the monitor component to check if VM is the default datasource
+	topo := reflect.ValueOf(i.topo)
+	if topo.Kind() == reflect.Pointer {
+		topo = topo.Elem()
+	}
+	val := topo.FieldByName("Monitors")
+	if (val == reflect.Value{}) {
+		return errors.Errorf("field Monitors not found in topology: %v", topo)
+	}
+
+	// Determine which datasource to use in dashboards
+	datasourceName := clusterName
+	monitors := val.Interface().([]*PrometheusSpec)
+	if len(monitors) > 0 && monitors[0].PromRemoteWriteToVM && monitors[0].NgPort > 0 && (spec.UseVMAsDatasource) {
+		datasourceName = fmt.Sprintf("%s-vm", clusterName)
+	}
+
+	// Deal with the cluster name and datasource
+	// Replace literal dashboard placeholders first. The datasource name can contain
+	// "test-cluster" (for example, "test-cluster-vm"), so replacing these literals
+	// after datasource placeholders would rewrite the generated name a second time.
 	for _, cmd := range []string{
-		`find %s -type f -exec sed -i "s/\${DS_.*-CLUSTER}/%s/g" {} \;`,
-		`find %s -type f -exec sed -i "s/DS_.*-CLUSTER/%s/g" {} \;`,
-		`find %s -type f -exec sed -i "s/\${DS_LIGHTNING}/%s/g" {} \;`,
-		`find %s -type f -exec sed -i "s/DS_LIGHTNING/%s/g" {} \;`,
-		`find %s -type f -exec sed -i "s/test-cluster/%s/g" {} \;`,
-		`find %s -type f -exec sed -i "s/Test-Cluster/%s/g" {} \;`,
+		`find %s -type f -exec sed -i 's/test-cluster/%s/g' {} \;`,
+		`find %s -type f -exec sed -i 's/Test-Cluster/%s/g' {} \;`,
+		`find %s -type f -exec sed -i 's/\${DS_.*-CLUSTER}/%s/g' {} \;`,
+		`find %s -type f -exec sed -i 's/DS_.*-CLUSTER/%s/g' {} \;`,
+		`find %s -type f -exec sed -i 's/\${DS_LIGHTNING}/%s/g' {} \;`,
+		`find %s -type f -exec sed -i 's/DS_LIGHTNING/%s/g' {} \;`,
 	} {
-		cmd := fmt.Sprintf(cmd, dashboardsDir, clusterName)
+		cmd := fmt.Sprintf(cmd, dashboardsDir, datasourceName)
 		_, stderr, err := e.Execute(ctx, cmd, false)
 		if err != nil {
 			return errors.Annotatef(err, "stderr: %s", string(stderr))
@@ -263,9 +411,9 @@ func (i *GrafanaInstance) installDashboards(ctx context.Context, e ctxt.Executor
 		return errors.Annotatef(err, "stderr: %s", string(stderr))
 	}
 
-	srcPath := PackagePath(ComponentDMMaster, clusterVersion, i.OS(), i.Arch())
+	srcPath := PackagePath(GetDMMasterPackageName(i.topo), clusterVersion, i.OS(), i.Arch())
 	dstPath := filepath.Join(tmp, filepath.Base(srcPath))
-	err = e.Transfer(ctx, srcPath, dstPath, false)
+	err = e.Transfer(ctx, srcPath, dstPath, false, 0, false)
 	if err != nil {
 		return err
 	}
@@ -306,4 +454,25 @@ func (i *GrafanaInstance) ScaleConfig(
 	defer func() { i.topo = s }()
 	i.topo = topo.Merge(i.topo)
 	return i.InitConfig(ctx, e, clusterName, clusterVersion, deployUser, paths)
+}
+
+func mergeAdditionalGrafanaConf(source string, addition map[string]string) error {
+	bytes, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	result, err := ini.Load(bytes)
+	if err != nil {
+		return err
+	}
+	for k, v := range addition {
+		// convert "log.file.level to [log.file] level"
+		for i := len(k) - 1; i >= 0; i-- {
+			if k[i] == '.' {
+				result.Section(k[:i]).Key(k[i+1:]).SetValue(v)
+				break
+			}
+		}
+	}
+	return result.SaveTo(source)
 }

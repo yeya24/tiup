@@ -16,6 +16,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/pingcap/tiup/pkg/environment"
 	"github.com/pingcap/tiup/pkg/utils"
@@ -28,11 +29,11 @@ func newUpdateCmd() *cobra.Command {
 		Use:   "update [component1][:version] [component2..N]",
 		Short: "Update tiup components to the latest version",
 		Long: `Update some components to the latest version. Use --nightly
-to update to the latest nightly version. Use --all to update all components 
-installed locally. Use <component>:<version> to update to the specified 
-version. Components will be ignored if the latest version has already been 
-installed locally, but you can use --force explicitly to overwrite an 
-existing installation. Use --self which is used to update TiUP to the 
+to update to the latest nightly version. Use --all to update all components
+installed locally. Use <component>:<version> to update to the specified
+version. Components will be ignored if the latest version has already been
+installed locally, but you can use --force explicitly to overwrite an
+existing installation. Use --self which is used to update TiUP to the
 latest version. All other flags will be ignored if the flag --self is given.
 
   $ tiup update --all                     # Update all components to the latest stable version
@@ -46,6 +47,10 @@ latest version. All other flags will be ignored if the flag --self is given.
 
 			env := environment.GlobalEnv()
 			if self {
+				if err := checkTiUPBinary(env); err != nil {
+					return err
+				}
+
 				originFile := env.LocalPath("bin", "tiup")
 				renameFile := env.LocalPath("bin", "tiup.tmp")
 				if err := os.Rename(originFile, renameFile); err != nil {
@@ -98,4 +103,23 @@ func updateComponents(env *environment.Environment, components []string, nightly
 	}
 
 	return env.UpdateComponents(components, nightly, force)
+}
+
+// checkTiUPBinary check if TiUP exists in TiUP_HOME
+func checkTiUPBinary(env *environment.Environment) error {
+	tiUPHomePath, _ := filepath.Abs(env.LocalPath("bin", "tiup"))
+
+	realTiUPPath, err := os.Executable()
+	if err != nil {
+		// Ignore the problem that the execution directory cannot be obtained
+		return nil
+	}
+	realTiUPPath, _ = filepath.Abs(realTiUPPath)
+
+	if utils.IsNotExist(tiUPHomePath) || tiUPHomePath != realTiUPPath {
+		fmt.Printf("Tiup install directory is: %s\n", filepath.Dir(realTiUPPath))
+		return fmt.Errorf("if you used some external package manager to install TiUP (e.g., brew), try upgrade with that")
+	}
+
+	return nil
 }

@@ -15,7 +15,6 @@ package crypto
 
 import (
 	"crypto"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -24,6 +23,7 @@ import (
 	"net"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tiup/pkg/crypto/rand"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -139,11 +139,11 @@ func (k *RSAPrivKey) Deserialize(key []byte) error {
 	if block == nil {
 		return ErrorDeserializeKey
 	}
-	PrivKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	privKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
 		return err
 	}
-	k.key = PrivKey
+	k.key = privKey
 	return nil
 }
 

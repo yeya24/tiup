@@ -60,11 +60,10 @@ Flags:
       --binpath string                 Specify the binary path of component instance
   -h, --help                           help for tiup
       --skip-version-check             Skip the strict version check, by default a version must be a valid SemVer string
-  -T, --tag string                     Specify a tag for component instance
       --version                        version for tiup
 
-Component instances with the same "tag" will share a data directory ($TIUP_HOME/data/$tag):
-  $ tiup --tag mycluster playground
+Components that support "tag" share a data directory for the same tag ($TIUP_HOME/data/$tag):
+  $ tiup playground --tag mycluster
 
 Examples:
   $ tiup playground                    # Quick start
@@ -106,6 +105,7 @@ The difference between a command and a component is that the command comes with 
 
 [Package management](./package-manage.md) chapter will introduce all the commands and the components will be divided into chapters according to the different components:
 - [Local Rapid Deployment TiDB Cluster](./playground.md)
+- [Playground-NG (local playground with daemon mode)](./playground-ng.md)
 - [Online cluster deployment and operation](./cluster.md)
 - [build private mirror](./mirrors.md)
 - [package command](./package.md)
